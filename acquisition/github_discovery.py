@@ -80,7 +80,7 @@ class GitHubDiscoveryEngine:
                         max_pages=self.config.pages_per_query,
                     )
                 except Exception as exc:
-                    print(f"[WARN] Discovery query failed for {category}/{band}: {exc}")
+                    logger.warning("Discovery query failed for %s/%s: %s", category, band, exc)
                     continue
                 for repo in repos:
                     full_name = repo.get("full_name")
