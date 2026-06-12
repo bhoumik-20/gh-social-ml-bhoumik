@@ -122,7 +122,7 @@ class GitHubGraphQLClient:
             data_field = result.get("data")
             if isinstance(data_field, dict) and "rateLimit" in data_field:
                 rl = data_field["rateLimit"]
-                # Optional: log rate limit usage here
+                logger.debug("GraphQL rate limit: %s remaining", rl.get("remaining"))
             
             if "errors" in result:
                 # Some errors are partial, e.g., missing repository
