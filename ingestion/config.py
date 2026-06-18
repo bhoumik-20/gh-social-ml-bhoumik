@@ -1,5 +1,37 @@
 import os
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value_text = raw_value.strip()
+    if not value_text:
+        raise ValueError(f"{name} must be a positive integer; got an empty value.")
+    try:
+        value = int(value_text)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer; got {raw_value!r}.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer; got {value}.")
+    return value
+
+
+def _non_negative_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value_text = raw_value.strip()
+    if not value_text:
+        raise ValueError(f"{name} must be a non-negative integer; got an empty value.")
+    try:
+        value = int(value_text)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer; got {raw_value!r}.") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer; got {value}.")
+    return value
+
 NOVELTY_THRESHOLD               = 0.35
 TOP_K_COMPARISONS               = 5
 EMBEDDING_MODEL                 = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -37,8 +69,13 @@ NOVELTY_WEIGHTS = {
 REPOSITORY_EMBEDDING_MODEL = EMBEDDING_MODEL
 REPOSITORY_EMBEDDING_DIM = EMBEDDING_DIM
 REPOSITORY_EMBEDDING_VERSION = os.getenv("REPOSITORY_EMBEDDING_VERSION", "repo-embedding-v1")
-README_CHUNK_CHARS = int(os.getenv("README_CHUNK_CHARS", "2500"))
-README_CHUNK_OVERLAP_CHARS = int(os.getenv("README_CHUNK_OVERLAP_CHARS", "250"))
+README_CHUNK_CHARS = _positive_int_env("README_CHUNK_CHARS", 2500)
+README_CHUNK_OVERLAP_CHARS = _non_negative_int_env("README_CHUNK_OVERLAP_CHARS", 250)
+if README_CHUNK_OVERLAP_CHARS >= README_CHUNK_CHARS:
+    raise ValueError(
+        "README_CHUNK_OVERLAP_CHARS must be smaller than README_CHUNK_CHARS; "
+        f"got {README_CHUNK_OVERLAP_CHARS} >= {README_CHUNK_CHARS}."
+    )
 
 REPO_TOWER_WEIGHTS = {
     "readme": 0.60,
