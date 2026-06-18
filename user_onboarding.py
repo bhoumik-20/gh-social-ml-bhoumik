@@ -36,9 +36,17 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
 # Safely parse VECTOR_DIMENSION with fallback to prevent crashes on invalid values
 try:
-    VECTOR_DIMENSION: int = int(os.getenv("VECTOR_DIMENSION", "384"))
+    dim_value = os.getenv("VECTOR_DIMENSION", "384")
+    VECTOR_DIMENSION: int = int(dim_value)
+    # Validate dimension is positive and reasonable
+    if VECTOR_DIMENSION <= 0:
+        logger.warning(f"VECTOR_DIMENSION must be positive, got {VECTOR_DIMENSION}. Using default 384.")
+        VECTOR_DIMENSION = 384
+    elif VECTOR_DIMENSION > 10000:
+        logger.warning(f"VECTOR_DIMENSION unusually large ({VECTOR_DIMENSION}). Using default 384.")
+        VECTOR_DIMENSION = 384
 except (ValueError, TypeError):
-    logger.warning("Invalid VECTOR_DIMENSION in environment, using default 384")
+    logger.warning(f"Invalid VECTOR_DIMENSION in environment: {dim_value}. Using default 384")
     VECTOR_DIMENSION: int = 384
 QDRANT_URL: str | None = os.getenv("QDRANT_URL", None)
 QDRANT_API_KEY: str | None = os.getenv("QDRANT_API_KEY", None)
@@ -129,22 +137,40 @@ class UserOnboardingPipeline:
     def __init__(self, embedding_model: str | None = None) -> None:
         """Initialize the user onboarding pipeline.
 
+        The SentenceTransformer model is loaded lazily on first use to allow
+        the pipeline to be instantiated in environments without ML dependencies
+        (e.g., for saving precomputed vectors to Qdrant).
+
         Args:
             embedding_model: Name of the SentenceTransformer model to use.
                 Defaults to EMBEDDING_MODEL environment variable or 'all-MiniLM-L6-v2'.
+        """
+        self.model_name = embedding_model or EMBEDDING_MODEL
+        self._model = None  # Lazy-loaded model
+
+    def _get_model(self):
+        """Lazy-load the SentenceTransformer model on first access.
+
+        Returns:
+            The loaded SentenceTransformer model.
 
         Raises:
             ImportError: If sentence-transformers is not installed.
         """
-        if not HAS_SENTENCE_TRANSFORMERS:
-            raise ImportError(
-                "sentence-transformers is not installed. "
-                "Run 'pip install sentence-transformers' to enable embeddings."
-            )
+        if self._model is None:
+            if not HAS_SENTENCE_TRANSFORMERS:
+                raise ImportError(
+                    "sentence-transformers is not installed. "
+                    "Run 'pip install sentence-transformers' to enable embeddings."
+                )
+            self._model = SentenceTransformer(self.model_name)
+            logger.info(f"Lazy-loaded SentenceTransformer with model: {self.model_name}")
+        return self._model
 
-        self.model_name = embedding_model or EMBEDDING_MODEL
-        self.model = SentenceTransformer(self.model_name)
-        logger.info(f"Initialized SentenceTransformer with model: {self.model_name}")
+    @property
+    def model(self):
+        """Property to access the lazily-loaded model."""
+        return self._get_model()
 
     def synthesize_user_context(self, user_data: Dict[str, Any]) -> str:
         """Flatten user profile data into a single dense text string.
@@ -201,7 +227,8 @@ class UserOnboardingPipeline:
             raise ValueError("Cannot generate vector from empty user data.")
 
         try:
-            embedding = self.model.encode(context)
+            model = self._get_model()  # Lazy load
+            embedding = model.encode(context)
             if embedding is None:
                 raise ValueError("Model.encode returned None.")
             vector = embedding.tolist()
@@ -248,11 +275,11 @@ class UserOnboardingPipeline:
             qdrant_api_key: Qdrant API key. Defaults to QDRANT_API_KEY environment variable.
 
         Returns:
-            True if the vector was successfully saved, False otherwise.
+            True if the vector was successfully saved.
 
         Raises:
             ImportError: If qdrant-client is not installed.
-            ValueError: If user_id or vector validation fails.
+            ValueError: If user_id, vector validation fails, or QDRANT_URL is not set.
             Exception: If Qdrant operation fails (propagated for caller handling).
         """
         if not HAS_QDRANT:
@@ -289,11 +316,10 @@ class UserOnboardingPipeline:
         api_key = qdrant_api_key or QDRANT_API_KEY
 
         if not url:
-            logger.error(
+            raise ValueError(
                 "QDRANT_URL is not set. Cannot connect to Qdrant. "
                 "Set it in your .env file or pass it as a parameter."
             )
-            return False
 
         # Ensure payload contains user_id (deep copy to avoid mutating caller's nested objects)
         if payload is None:
@@ -308,7 +334,10 @@ class UserOnboardingPipeline:
             client = QdrantClient(url=url, api_key=api_key, timeout=30.0)
 
             # Check if collection exists, create if not
-            collections = client.get_collections().collections
+            collections_response = client.get_collections()
+            if collections_response is None or collections_response.collections is None:
+                raise ValueError("Failed to retrieve collections from Qdrant.")
+            collections = collections_response.collections
             collection_names = [col.name for col in collections]
 
             if USER_PROFILES_COLLECTION not in collection_names:
@@ -464,6 +493,7 @@ def save_user_vector_to_qdrant(
     if not isinstance(vector, list) or len(vector) == 0:
         raise ValueError("vector must be a non-empty list.")
     
+    # Use pipeline instance for save_to_qdrant (no ML model needed)
     pipeline = UserOnboardingPipeline()
     return pipeline.save_to_qdrant(
         user_id=user_id,
