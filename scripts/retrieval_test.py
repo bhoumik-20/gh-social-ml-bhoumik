@@ -9,10 +9,10 @@ from time import perf_counter
 
 from dotenv import load_dotenv
 
-from ingestion.config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
-from ingestion.embedding_pipeline import RepositoryEmbeddingPipeline
-from ingestion.qdrant_store import QdrantRepositoryStore
-from ingestion.repository_embedding import RepositoryEmbeddingConfig
+from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
+from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+from embedding.qdrant_store import QdrantRepositoryStore
+from embedding.repository_embedding import RepositoryEmbeddingConfig
 
 
 DEFAULT_QUERIES = [

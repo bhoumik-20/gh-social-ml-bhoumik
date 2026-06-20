@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
-from .config import NOVELTY_THRESHOLD
+from config import NOVELTY_THRESHOLD
 
 @dataclass
 class NoveltyMatrix:

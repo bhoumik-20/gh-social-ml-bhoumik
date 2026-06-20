@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import README_CHUNK_CHARS, README_CHUNK_OVERLAP_CHARS, REPOSITORY_EMBEDDING_MODEL
+from config import README_CHUNK_CHARS, README_CHUNK_OVERLAP_CHARS, REPOSITORY_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 

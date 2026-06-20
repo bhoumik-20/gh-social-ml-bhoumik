@@ -5,7 +5,7 @@ from .features import extract_tags, score_documentation, activity_score, trend_v
 from .classification import classify_category
 from .corpus import CorpusStore, dynamic_cluster_discovery
 from .result import IngestionResult, NoveltyMatrix
-from .config import GATE_APPROVAL_THRESHOLD, MIN_STARS_PREFILTER, MIN_README_PREFILTER
+from config import GATE_APPROVAL_THRESHOLD, MIN_STARS_PREFILTER, MIN_README_PREFILTER
 
 def _rejected_prefilter_result(repo_id: str, reason: str, repo: dict) -> IngestionResult:
     mock_novelty = NoveltyMatrix(

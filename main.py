@@ -50,6 +50,7 @@ def run_acquisition(
     *,
     limit: int = 100,
     batch_size: int = 10,
+    existing_repos: set[str] | None = None,
 ) -> list:
     """
     Discover and enrich GitHub repositories via GraphQL only.
@@ -67,14 +68,29 @@ def run_acquisition(
     from acquisition.repository_enricher import RepositoryEnricher
 
     client   = GitHubGraphQLClient(token=token)
-    config   = DiscoveryConfig(total_limit=limit + 20)   # small buffer to hit the target
+    # Fetch a larger buffer of candidate repositories to account for filtering duplicates
+    discovery_limit = limit + 50 if existing_repos else limit + 20
+    config   = DiscoveryConfig(total_limit=discovery_limit)
     discovery = GitHubDiscoveryEngine(client, config=config)
     enricher  = RepositoryEnricher(graphql_client=client)
 
     # ── Step 1: Discovery ─────────────────────────────────────────────────────
     logger.info("Discovering repositories …")
-    discovered = discovery.discover(limit=limit + 20)
+    discovered = discovery.discover(limit=discovery_limit)
     logger.info("Discovered %d candidate repos", len(discovered))
+
+    if existing_repos:
+        new_discovered = []
+        for r in discovered:
+            full_name = r if isinstance(r, str) else r.get("full_name", "")
+            if full_name not in existing_repos:
+                new_discovered.append(r)
+        logger.info(
+            "Filtered out %d already existing repos from candidates. %d new candidates remain.",
+            len(discovered) - len(new_discovered),
+            len(new_discovered),
+        )
+        discovered = new_discovered
 
     # ── Step 2: Enrichment in batches ─────────────────────────────────────────
     logger.info("Enriching in batches of %d …", batch_size)
@@ -180,10 +196,10 @@ def index_approved_repositories(
         logger.warning("Skipping Qdrant indexing because no repositories passed the filter.")
         return []
 
-    from ingestion.config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
-    from ingestion.embedding_pipeline import RepositoryEmbeddingPipeline
-    from ingestion.qdrant_store import QdrantRepositoryStore
-    from ingestion.repository_embedding import RepositoryEmbeddingConfig
+    from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
+    from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+    from embedding.qdrant_store import QdrantRepositoryStore
+    from embedding.repository_embedding import RepositoryEmbeddingConfig
 
     embedding_config = RepositoryEmbeddingConfig(
         model_name=embedding_model or os.getenv("EMBEDDING_MODEL") or "all-MiniLM-L6-v2",
@@ -246,7 +262,7 @@ def _parse_args() -> argparse.Namespace:
         prog="main.py",
         description="gh-social-ml acquisition pipeline: Discovery → Enrichment → Quality Filter",
     )
-    p.add_argument("--limit",            type=int, default=100,    help="Target number of repos (default: 100)")
+    p.add_argument("--limit",            type=int, default=100,    help="Maximum number of repositories to fetch in this run (default: 100)")
     p.add_argument("--batch-size",       type=int, default=10,     help="Enrichment batch size (default: 10)")
     p.add_argument("--min-readme-chars", type=int, default=200,    help="Minimum README length to keep a repo (default: 200)")
     p.add_argument("--index-qdrant",     action="store_true",      help="Deprecated: Qdrant indexing now runs by default")
@@ -273,50 +289,158 @@ if __name__ == "__main__":
     logger.info("║  gh-social-ml  ·  Acquisition    ║")
     logger.info("╚══════════════════════════════════╝")
 
-    enriched          = run_acquisition(token, limit=args.limit, batch_size=args.batch_size)
-    kept, dropped     = filter_enriched(enriched, min_readme_chars=args.min_readme_chars)
-
-    logger.info(
-        "Quality filter: %d kept, %d dropped  (min_readme_chars=%d)",
-        len(kept), len(dropped), args.min_readme_chars,
-    )
-
-    _print_summary(kept, dropped)
-
-    if not args.no_index_qdrant:
-        # The below block is for automatic Qdrant indexing after filtering; use
-        # --no-index-qdrant only for acquisition-only local runs.
-        try:
-            indexed = index_approved_repositories(
-                kept,
-                qdrant_url=args.qdrant_url,
-                qdrant_api_key=args.qdrant_api_key,
-                qdrant_collection=args.qdrant_collection,
-                embedding_model=args.embedding_model,
-            )
-            logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
-        except Exception as exc:
-            logger.error("Qdrant indexing failed; continuing to database ingestion: %s", exc)
-
-    # ── Step 3: Database Ingestion ────────────────────────────────────────────
+    # ── Step 1: Database Check ────────────────────────────────────────────────
     from database import PostgreSQLConnector
     db = PostgreSQLConnector()
+    
+    current_count = 0
+    db_verified = False
     if db.enabled:
         if db.verify_connection():
             try:
                 db.init_db()
+                current_count = db.get_repo_count()
+                logger.info(f"Current repositories in PostgreSQL database: {current_count}")
+                db_verified = True
+            except Exception as db_exc:
+                logger.error(f"Failed to query database repository count: {db_exc}")
+        else:
+            logger.warning("Database connection failed. Ingestion/hydration will be disabled. Check DATABASE_URL in .env.")
+    else:
+        logger.info("Database connector is not enabled. Ingestion/hydration will be disabled.")
+
+    target_count = 1000
+    kept = []
+
+    # ── Step 2: Fetch & Index if under target ─────────────────────────────────
+    # If database is enabled and connected, we target reaching target_count.
+    # Otherwise, we just fetch args.limit repositories directly.
+    if db_verified:
+        should_fetch = current_count < target_count
+        fetch_limit = min(target_count - current_count, args.limit)
+    else:
+        should_fetch = True
+        fetch_limit = args.limit
+
+    if not should_fetch:
+        logger.info(f"Approved corpus has {current_count} repositories (>= {target_count}). Skipping new repository acquisition.")
+    else:
+        if db_verified:
+            logger.info(f"Approved corpus has {current_count} repositories. Fetching up to {fetch_limit} repositories to reach the {target_count} target...")
+        else:
+            logger.info(f"Database ingestion is disabled. Fetching exactly {fetch_limit} repositories for local execution...")
+
+        # Load existing repos to filter out duplicates in run_acquisition
+        existing_repos = set()
+        if db.enabled and db_verified:
+            conn = None
+            try:
+                conn = db.connect()
+                cursor = conn.cursor()
+                cursor.execute("SELECT full_name FROM Repo;")
+                existing_repos = {row[0] for row in cursor.fetchall()}
+                logger.info(f"Loaded {len(existing_repos)} existing repository names from database.")
+            except Exception as e:
+                logger.warning(f"Could not fetch existing repository names: {e}")
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        enriched = run_acquisition(token, limit=fetch_limit, batch_size=args.batch_size, existing_repos=existing_repos)
+        kept, dropped = filter_enriched(enriched, min_readme_chars=args.min_readme_chars)
+
+        logger.info(
+            "Quality filter: %d kept, %d dropped  (min_readme_chars=%d)",
+            len(kept), len(dropped), args.min_readme_chars,
+        )
+
+        _print_summary(kept, dropped)
+
+        # PostgreSQL Ingestion (First to ensure consistency and prevent orphaned points in Qdrant)
+        db_ingestion_success = False
+        if kept and db_verified:
+            try:
                 saved_count = db.upsert_repositories(kept)
-                total = db.get_repo_count()
+                current_count = db.get_repo_count()
                 logger.info(
                     f"Database ingestion complete: {saved_count} upserted this run, "
-                    f"{total} total repos in database."
+                    f"{current_count} total repos in database."
                 )
+                db_ingestion_success = True
             except Exception as db_exc:
                 logger.error(f"Failed to ingest repositories into database: {db_exc}")
-        else:
-            logger.error(
-                "Database connection test failed. Check DATABASE_URL in .env. "
-                "Skipping database upload."
+        elif kept and not db_verified:
+            # If DB is not enabled/verified, treat as success to proceed with Qdrant indexing
+            db_ingestion_success = True
+
+        # Qdrant Indexing
+        if kept and db_ingestion_success and not args.no_index_qdrant:
+            try:
+                indexed = index_approved_repositories(
+                    kept,
+                    qdrant_url=args.qdrant_url,
+                    qdrant_api_key=args.qdrant_api_key,
+                    qdrant_collection=args.qdrant_collection,
+                    embedding_model=args.embedding_model,
+                )
+                logger.info("Qdrant indexing complete: %d repository vectors stored", len(indexed))
+            except Exception as exc:
+                logger.error("Qdrant indexing failed: %s", exc)
+
+    # ── Step 3: Candidate Retrieval for Hardcoded Users ───────────────────────
+    if current_count >= target_count:
+        logger.info("Corpus target of 1000 reached. Executing L1 Candidate Retrieval Demo...")
+        try:
+            from scripts.mock_users import MOCK_USERS
+            from retrieval import CandidateRetriever
+            from scripts.user_onboarding import generate_interest_vector
+
+            retriever = CandidateRetriever(
+                db_connector=db,
+                qdrant_url=args.qdrant_url,
+                qdrant_api_key=args.qdrant_api_key
             )
+
+            print("\n" + "═" * 80)
+            print("                 L1 CANDIDATE RETRIEVAL PIPELINE DEMO")
+            print("═" * 80)
+
+            for user in MOCK_USERS:
+                print(f"\n👤 USER: {user['full_name']} (@{user['user_id']})")
+                print(f"   Bio: {user['bio']}")
+                print(f"   Interests: {user['interests']}")
+                print("   Generating user interest vector...")
+
+                user_vector = generate_interest_vector(user)
+
+                print("   Running multi-channel retrieval (Target: 120 Semantic, 30 Trending)...")
+                candidates = retriever.retrieve_candidates(
+                    user_embedding=user_vector,
+                    user_interests=user["interests"]
+                )
+
+                print(f"   Successfully retrieved {len(candidates)} candidates.")
+                print("-" * 80)
+                print(f"{'#':<4} {'Repository':<42} {'Source':<10} {'Score/Stars':<12} {'Embedding Hydrated?'}")
+                print("-" * 80)
+                for i, c in enumerate(candidates, 1):
+                    source = c.get("retrieval_source", "unknown")
+                    score_str = "—"
+                    if source == "semantic":
+                        score_str = f"{c.get('retrieval_score', 0.0):.4f}"
+                    elif source == "trending":
+                        score_str = f"{c.get('star_count', 0):,} stars"
+                    
+                    has_embedding = "Yes (384-d)" if c.get("repo_embedding") is not None and len(c.get("repo_embedding")) == 384 else "No"
+                    print(f"{i:<4} {c.get('full_name') or 'Unknown':<42} {source:<10} {score_str:<12} {has_embedding}")
+                print("═" * 80)
+        except Exception as exc:
+            logger.error(f"Failed to run Candidate Retrieval demo: {exc}", exc_info=True)
     else:
-        logger.info("DATABASE_URL not set; skipping database upload.")
+        logger.warning(
+            f"Approved corpus size is currently {current_count} repositories. "
+            f"L1 Candidate Retrieval Demo will run once the corpus reaches the target of {target_count} repositories."
+        )

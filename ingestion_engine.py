@@ -1,12 +1,13 @@
 import os
 import sys
 import json
-from ingestion import *
+from ingestion.pipeline import ingest_repository, ingest_batch, print_batch_summary
+from ingestion.features import extract_tags, score_documentation, activity_score, trend_velocity, build_structured_summary, DocResult
+from ingestion.classification import classify_category
+from ingestion.corpus import CorpusStore, dynamic_cluster_discovery
+from ingestion.result import IngestionResult, NoveltyMatrix
 
-# For backwards compatibility with tests and direct module access:
-import ingestion.config as config
-from ingestion.result import NoveltyMatrix
-from ingestion.features import DocResult
+import config as config
 
 if __name__ == "__main__":
     target_data_json_path = "/mnt/user-data/uploads/staged_repositories.json"

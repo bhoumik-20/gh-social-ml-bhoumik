@@ -134,7 +134,9 @@ class GitHubDiscoveryEngine:
         now = datetime.now(timezone.utc)
         pushed_recent = (now - timedelta(days=45)).date().isoformat()
         created_recent = (now - timedelta(days=180)).date().isoformat()
-        base = f'{term} in:name,description,readme fork:false archived:false'
+        # Randomize search query to get new repositories instead of duplicate top results
+        rand_char = self.random.choice("abcdefghijklmnopqrstuvwxyz")
+        base = f'{term} {rand_char} in:name,description,readme fork:false archived:false'
         if band == "high_star":
             return f"{base} stars:>500"
         if band == "recently_active":

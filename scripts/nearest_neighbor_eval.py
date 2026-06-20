@@ -14,15 +14,15 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from ingestion.config import (
+from config import (
     QDRANT_API_KEY,
     QDRANT_COLLECTION_NAME,
     QDRANT_DISTANCE,
     QDRANT_URL,
     QDRANT_VECTOR_NAME,
 )
-from ingestion.qdrant_store import QdrantRepositoryStore
-from ingestion.repository_embedding import RepositoryEmbeddingConfig
+from embedding.qdrant_store import QdrantRepositoryStore
+from embedding.repository_embedding import RepositoryEmbeddingConfig
 
 
 BATCH_SIZE = 10

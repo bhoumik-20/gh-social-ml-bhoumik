@@ -6,7 +6,7 @@ import logging
 import uuid
 from collections.abc import Iterable
 
-from .config import (
+from config import (
     QDRANT_API_KEY,
     QDRANT_COLLECTION_NAME,
     QDRANT_DISTANCE,

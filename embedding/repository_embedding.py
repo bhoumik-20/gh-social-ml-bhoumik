@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import (
+from config import (
     README_CHUNK_CHARS,
     README_CHUNK_OVERLAP_CHARS,
     REPO_TOWER_WEIGHTS,
@@ -16,14 +16,14 @@ from .config import (
     REPOSITORY_EMBEDDING_VERSION,
 )
 from .embeddings import Vector, aggregate_vectors
-from .features import (
+from ingestion.features import (
     activity_score,
     extract_tags,
     score_code_health,
     score_documentation,
     trend_velocity,
 )
-from .classification import classify_category
+from ingestion.classification import classify_category
 
 
 SUPPORTED_REPOSITORY_EMBEDDING_DIMS = {

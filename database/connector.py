@@ -285,6 +285,10 @@ class PostgreSQLConnector:
                 ("star_count", "INT DEFAULT 0"),
                 ("forks_count", "INT DEFAULT 0"),
                 ("pr_count", "INT DEFAULT 0"),
+                ("likes_count", "INT DEFAULT 0"),
+                ("comments_count", "INT DEFAULT 0"),
+                ("saves_count", "INT DEFAULT 0"),
+                ("views_count", "INT DEFAULT 0"),
             ]
             for col_name, col_def in _migration_columns:
                 try:
