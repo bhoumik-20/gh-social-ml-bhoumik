@@ -359,5 +359,5 @@ class TestErrorRecovery:
         with patch.object(storage, 'init_schema'):
             upserted = storage.upsert_repositories(repositories)
         
-        # Should succeed for first repo, fail for second
-        assert upserted == 1
+        # Should succeed for second and third repos, fail for first
+        assert upserted == 2

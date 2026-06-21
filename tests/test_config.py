@@ -79,6 +79,7 @@ class TestConfigEnvironmentVariables:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert trending.config.TRENDING_REPO_LIMIT == 50
 
     def test_refresh_hours_from_env(self, monkeypatch):
@@ -87,6 +88,7 @@ class TestConfigEnvironmentVariables:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert trending.config.TRENDING_REFRESH_HOURS == 12
 
     def test_database_url_from_env(self, monkeypatch):
@@ -105,6 +107,7 @@ class TestConfigEnvironmentVariables:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert trending.config.FETCH_README is False
         assert trending.config.FETCH_TOPICS is False
         assert trending.config.CONTINUE_ON_ERROR is False
@@ -171,6 +174,7 @@ class TestConfigTypeConversion:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert isinstance(trending.config.TRENDING_REPO_LIMIT, int)
         assert trending.config.TRENDING_REPO_LIMIT == 100
 
@@ -180,6 +184,7 @@ class TestConfigTypeConversion:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert isinstance(trending.config.GITHUB_TIMEOUT_SECONDS, float)
         assert trending.config.GITHUB_TIMEOUT_SECONDS == 60.5
 
@@ -189,6 +194,7 @@ class TestConfigTypeConversion:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert isinstance(trending.config.GITHUB_MAX_RETRIES, int)
         assert trending.config.GITHUB_MAX_RETRIES == 10
 
@@ -198,5 +204,6 @@ class TestConfigTypeConversion:
         import importlib
         import trending.config
         importlib.reload(trending.config)
+        trending.config.validate_config()
         assert isinstance(trending.config.README_MAX_LENGTH, int)
         assert trending.config.README_MAX_LENGTH == 50000

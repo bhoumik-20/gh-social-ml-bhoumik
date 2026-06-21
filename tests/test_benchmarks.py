@@ -132,7 +132,7 @@ class TestStoragePerformance:
         mock_conn.cursor.return_value = mock_cursor
         mock_cursor.fetchall.return_value = [
             ("test/repo", "repo", "test", "https://github.com/test/repo", "Test",
-             100, 10, "2024-01-01", "2024-06-01", "Python", '["ml", "ai"]',
+             100, 100, 10, "2024-01-01", "2024-06-01", "Python", '["ml", "ai"]',
              "# README", "main", "2024-01-01", "2024-06-01", i)
             for i in range(1, 31)
         ]

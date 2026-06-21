@@ -13,12 +13,16 @@ from trending.storage import TrendingStorage
 class TestTrendingStorageInit:
     """Test TrendingStorage initialization."""
 
-    def test_init_with_default_database_url(self):
+    def test_init_with_default_database_url(self, monkeypatch):
         """Test initialization with default database URL."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost:5432/test_db")
+        # Reload config to pick up the environment variable
+        import importlib
+        import trending.config
+        importlib.reload(trending.config)
         storage = TrendingStorage()
-        # db_url will be DATABASE_URL from config (may be None in test env)
-        # The important thing is that it falls back to config
-        assert storage.db_url == DATABASE_URL
+        # db_url will be DATABASE_URL from config
+        assert storage.db_url == trending.config.DATABASE_URL
         assert storage.connector is not None
 
     def test_init_with_custom_database_url(self):
@@ -30,6 +34,10 @@ class TestTrendingStorageInit:
     def test_init_without_database_url(self, monkeypatch):
         """Test initialization when DATABASE_URL is not set."""
         monkeypatch.delenv("DATABASE_URL", raising=False)
+        # Reload config to pick up the change
+        import importlib
+        import trending.config
+        importlib.reload(trending.config)
         storage = TrendingStorage()
         assert storage.enabled is False
 
@@ -312,7 +320,7 @@ class TestGetTrendingRepositories:
         mock_conn.cursor.return_value = mock_cursor
         mock_cursor.fetchall.return_value = [
             ("test/repo", "repo", "test", "https://github.com/test/repo", "Test",
-             100, 10, "2024-01-01", "2024-06-01", "Python", '["ml", "ai"]',
+             100, 100, 10, "2024-01-01", "2024-06-01", "Python", '["ml", "ai"]',
              "# README", "main", "2024-01-01", "2024-06-01", 1)
         ]
         

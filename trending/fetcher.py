@@ -80,11 +80,11 @@ class TrendingFetcher:
                 logger.warning(f"Attempt {attempt + 1} failed, retrying: {exc}")
                 time.sleep(2 ** attempt)
 
-    def _parse_trending_html(self, html: str) -> list[dict[str, Any]]:
+    def _parse_trending_html(self, raw_html: str) -> list[dict[str, Any]]:
         """Parse the GitHub Trending HTML to extract repository data.
 
         Args:
-            html: Raw HTML content from the trending page.
+            raw_html: Raw HTML content from the trending page.
 
         Returns:
             List of parsed repository dictionaries with raw data from the page.
@@ -102,7 +102,7 @@ class TrendingFetcher:
             re.DOTALL
         )
         
-        for match in repo_pattern.finditer(html):
+        for match in repo_pattern.finditer(raw_html):
             repo_html = match.group(0)
             
             try:

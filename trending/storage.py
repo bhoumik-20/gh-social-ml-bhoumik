@@ -155,6 +155,7 @@ class TrendingStorage:
 
         conn = None
         upserted_count = 0
+        successful_full_names = []
         try:
             conn = self.connector.connect()
             cursor = conn.cursor()
@@ -231,6 +232,7 @@ class TrendingStorage:
 
                     cursor.execute(upsert_query, params)
                     upserted_count += 1
+                    successful_full_names.append(repo["full_name"])
 
                 except Exception as exc:
                     logger.warning(f"Failed to upsert repo {repo.get('full_name')}: {exc}")
@@ -241,7 +243,6 @@ class TrendingStorage:
             logger.info(f"Successfully upserted {upserted_count}/{len(repositories)} repositories.")
 
             # Remove repositories that are no longer trending (not in current successful batch)
-            successful_full_names = [repo["full_name"] for repo in repositories[:upserted_count]]
             if successful_full_names:
                 delete_query = f"""
                 DELETE FROM {config.TRENDING_TABLE_NAME}
@@ -254,7 +255,7 @@ class TrendingStorage:
 
             # Update metadata with last refresh timestamp
             self._update_metadata(cursor, "last_refresh", refresh_ts.isoformat())
-            self._update_metadata(cursor, "repo_count", str(upserted_count))
+            self._update_metadata(cursor, "repo_count", str(len(successful_full_names)))
             conn.commit()
 
         except Exception as exc:
