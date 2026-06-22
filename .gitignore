@@ -5,3 +5,10 @@ __pycache__/
 .DS_Store
 .env
 .coverage
+qdrant_storage/
+.venv/
+venv/
+
+# Local testing and verification scripts
+custom_test_users.json
+verify_app.ps1
