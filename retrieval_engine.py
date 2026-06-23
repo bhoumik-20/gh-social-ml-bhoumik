@@ -92,16 +92,18 @@ class RetrievalEngine:
 
         # Postgres connector — lazy, may be None if DATABASE_URL is not set
         self._db = None
+        self._db_failed = False
 
         # MMoE Ranker Service — lazy-loaded
         self._ranker = None
+        self._ranker_failed = False
 
     # ── Lazy Ranker Service ───────────────────────────────────────────────────
 
     @property
     def ranker(self):
         """Lazy-load the RankerService to avoid importing heavy libraries during startup."""
-        if self._ranker is None:
+        if self._ranker is None and not self._ranker_failed:
             try:
                 from inference.ranker_service import RankerService
                 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -110,22 +112,22 @@ class RetrievalEngine:
                 self._ranker = RankerService(model_path=model_path, scaler_path=scaler_path)
             except Exception as exc:
                 logger.warning("Could not initialize RankerService: %s. Using raw cosine scores.", exc)
-                self._ranker = False  # sentinel
-        return self._ranker if self._ranker is not False else None
+                self._ranker_failed = True
+        return self._ranker
 
     # ── Lazy Postgres connector ───────────────────────────────────────────────
 
     @property
     def db(self):
         """Lazy-load the database connector to avoid import-time failures."""
-        if self._db is None:
+        if self._db is None and not self._db_failed:
             try:
                 from database import PostgreSQLConnector
                 self._db = PostgreSQLConnector()
             except Exception as exc:
                 logger.warning("Could not initialize PostgreSQLConnector: %s", exc)
-                self._db = False  # sentinel: tried and failed
-        return self._db if self._db is not False else None
+                self._db_failed = True
+        return self._db
 
     # ── Core retrieval ────────────────────────────────────────────────────────
 
