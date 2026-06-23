@@ -109,6 +109,11 @@ class FeedbackHandler:
             return True
 
         column = METRIC_COLUMNS[action]
+        # Guard against SQL injection via strict whitelist validation (defense-in-depth)
+        if column not in {"views_count", "likes_count", "saves_count"}:
+            logger.error("Forbidden database column update: '%s'", column)
+            return False
+
         conn = None
         try:
             conn = self.db.connect()
