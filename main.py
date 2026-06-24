@@ -203,14 +203,25 @@ def _print_summary(kept: list, dropped: list) -> None:
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects zero and negative integers."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid integer")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {n}")
+    return n
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="main.py",
         description="gh-social-ml acquisition pipeline: Discovery → Enrichment → Quality Filter",
     )
-    p.add_argument("--limit",            type=int, default=150,    help="Maximum number of repositories to fetch in this run (default: 150)")
-    p.add_argument("--batch-size",       type=int, default=15,     help="Enrichment batch size (default: 15)")
-    p.add_argument("--workers",          type=int, default=4,      help="Concurrent enrichment workers (default: 4)")
+    p.add_argument("--limit",            type=_positive_int, default=150,    help="Maximum number of repositories to fetch in this run (default: 150)")
+    p.add_argument("--batch-size",       type=_positive_int, default=15,     help="Enrichment batch size (default: 15)")
+    p.add_argument("--workers",          type=_positive_int, default=4,      help="Concurrent enrichment workers, must be >= 1 (default: 4)")
     p.add_argument("--min-readme-chars", type=int, default=200,    help="Minimum README length to keep a repo (default: 200)")
     p.add_argument("--index-qdrant",     action="store_true",      help="Deprecated: Qdrant indexing now runs by default")
     p.add_argument("--no-index-qdrant",  action="store_true",      help="Skip automatic Qdrant indexing after filtering")

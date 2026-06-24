@@ -30,6 +30,10 @@ def run_acquisition(
       .topics           — list[str]
       .languages        — dict[str, int]  (language → bytes)
     """
+    # Clamp workers so ThreadPoolExecutor never receives 0 or a negative value,
+    # which would raise ValueError even when called outside of the CLI.
+    workers = max(1, workers)
+
     from acquisition.github_graphql_client import GitHubGraphQLClient
     from acquisition.github_discovery import GitHubDiscoveryEngine, DiscoveryConfig
     from acquisition.repository_enricher import RepositoryEnricher
@@ -61,9 +65,10 @@ def run_acquisition(
 
     # ── Step 2: Concurrent enrichment ─────────────────────────────────────────
     targets = discovered[:limit]
+    batches = [targets[i : i + batch_size] for i in range(0, len(targets), batch_size)]
     logger.info(
-        "Enriching %d repos with %d concurrent worker(s) …",
-        len(targets), workers,
+        "Enriching %d repos in %d batch(es) of up to %d with %d concurrent worker(s) …",
+        len(targets), len(batches), batch_size, workers,
     )
     enriched: list = []
 
@@ -80,28 +85,32 @@ def run_acquisition(
             )
         return _thread_local.enricher
 
-    def _enrich_one(repo: Any) -> Any:
-        return _get_thread_enricher().enrich(repo)
+    def _enrich_batch(batch: list[Any]) -> list[Any]:
+        # get_repositories_batch() uses a two-pass approach: lean metadata first,
+        # README fetched separately. A README failure only produces empty README
+        # data; the repo is still kept, not dropped entirely.
+        return _get_thread_enricher().get_repositories_batch(batch)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Submit all enrich() calls concurrently; each is an independent GraphQL
-        # round-trip so workers spend their time waiting on network, not the CPU.
+        # Each future processes one batch of batch_size repos. workers controls
+        # how many batches run concurrently; batch_size controls the GraphQL
+        # request payload size. Both levers are now effective.
         futures = {
-            executor.submit(_enrich_one, repo): repo
-            for repo in targets
+            executor.submit(_enrich_batch, batch): (i + 1, batch)
+            for i, batch in enumerate(batches)
         }
         for future in as_completed(futures):
-            repo = futures[future]
-            full_name = repo if isinstance(repo, str) else repo.get("full_name", "")
+            batch_num, batch = futures[future]
             try:
-                result = future.result()
-                if result:
-                    enriched.append(result)
-                    logger.info("  ✓  %-44s (total enriched: %d)", full_name, len(enriched))
-                else:
-                    logger.warning("  ✗  %s: enricher returned None", full_name)
+                results = future.result()
+                enriched.extend(results)
+                logger.info(
+                    "  Batch %d/%d → +%d enriched  (total: %d)",
+                    batch_num, len(batches), len(results), len(enriched),
+                )
             except Exception as exc:
-                logger.warning("  ✗  %s: %s", full_name, exc)
+                logger.warning("  Batch %d/%d failed: %s", batch_num, len(batches), exc)
+
 
     logger.info("Acquisition complete — %d / %d repos enriched", len(enriched), limit)
     return enriched
