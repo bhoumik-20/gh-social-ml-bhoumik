@@ -17,8 +17,8 @@ class FeedAssemblySystem:
         
         # --- PART 1: FRESHNESS INJECTION ---
         for item in candidates:
-            if 'score' not in item or item['score'] is None:
-                item['score'] = 0.5
+            base_score = item.get('final_score') or item.get('score') or 0.5
+            item['score'] = base_score
                 
             raw_created_at = item.get('created_at')
             if not raw_created_at:
@@ -36,19 +36,17 @@ class FeedAssemblySystem:
                 if created_date.tzinfo is None:
                     created_date = created_date.replace(tzinfo=timezone.utc)
 
-                # Calculate decimal age in hours
-                age_hours = max(0.0, (current_time - created_date).total_seconds() / 3600.0)
-
-                # Apply smooth hyperbolic logarithmic decay boost if under 48 hours old
-                if age_hours < 48.0:
-                    boost = 0.25 * (1.1 / (1.0 + math.log1p(age_hours)))
-                    item['score'] += boost
+                # Add a guard before line 40:
+                if created_date > current_time:
+                    age_hours = 48.0  # Treat it as old/neutral rather than brand new
+                else:
+                    age_hours = max(0.0, (current_time - created_date).total_seconds() / 3600.0)
             except Exception as e:
                 logger.error(f"Freshness parsing failed for repo {item.get('repo_id')}: {e}")
                 continue
 
         # Re-sort the 15 repos after applying freshness boosts
-        candidates.sort(key=lambda x: x.get('score', 0.5), reverse=True)
+        candidates.sort(key=lambda x: x.get('score') or x.get('final_score') or 0.5, reverse=True)
 
         # --- PART 2: EXPLORATION INJECTION ---
         # Safeguard anchor tier (Top 10) and introduce discovery variations to the bottom tier (Bottom 5)
@@ -62,4 +60,5 @@ class FeedAssemblySystem:
             final_pool = candidates
 
         # Strip internal temporary scores and return clean ordered string IDs
-        return [str(item['repo_id']) for item in final_pool[:target_size]]
+        return [str(item.get('repo_id') or item.get('id') or item.get('full_name') or '') for item in final_pool[:target_size]]
+    

@@ -36,8 +36,9 @@ async def assemble_feed_endpoint(candidates: list = Body(..., embed=True)):
         return {
             "error": "Internal Processing Exception",
             "details": str(err),
-            "rankedRepoIds": [item.get("repo_id") for item in candidates][:15] # Return base order as recovery
-        }
+            "rankedRepoIds": [(item.get("repo_id") if isinstance(item, dict) else str(item)) 
+                              for item in candidates[:15] ]        
+    }
 
 if __name__ == "__main__":
     # Run the Uvicorn worker locally on Port 8000
