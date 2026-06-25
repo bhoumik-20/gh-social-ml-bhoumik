@@ -60,6 +60,10 @@ class FeedbackConsumer:
                 user_id = event.get("user_id")
                 repo_id = event.get("repo_id")
                 action = event.get("action")
+                # The below extraction is for passing observed dwell time to
+                # the handler so it can compute the embedding alpha correctly.
+                dwell_seconds_raw = event.get("dwell_seconds")
+                dwell_seconds = float(dwell_seconds_raw) if dwell_seconds_raw is not None else None
 
                 if not user_id or not repo_id or not action:
                     queue.task_done()
@@ -67,8 +71,9 @@ class FeedbackConsumer:
 
                 # Process feedback
                 try:
-                    # Execute vector updates and metric increments
-                    self.handler.handle_feedback(user_id, repo_id, action)
+                    self.handler.handle_feedback(
+                        user_id, repo_id, action, dwell_seconds=dwell_seconds
+                    )
                 except Exception as exc:
                     logger.error("Exception occurred while handling feedback: %s", exc)
                 finally:
@@ -122,6 +127,16 @@ class FeedbackConsumer:
                         user_id = payload.get("user_id")
                         repo_id = payload.get("repo_id")
                         action = payload.get("action")
+                        # Redis Stream values are strings — parse dwell_seconds back to float.
+                        dwell_seconds_raw = payload.get("dwell_seconds")
+                        try:
+                            dwell_seconds = float(dwell_seconds_raw) if dwell_seconds_raw is not None else None
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Could not parse dwell_seconds '%s' for message %s. Treating as None.",
+                                dwell_seconds_raw, message_id,
+                            )
+                            dwell_seconds = None
 
                         if user_id and repo_id and action:
                             processed_key = f"feedback:processed:{message_id}"
@@ -149,10 +164,10 @@ class FeedbackConsumer:
                                     # Execute vector updates and metric increments
                                     await loop.run_in_executor(
                                         None,
-                                        self.handler.handle_feedback,
-                                        user_id,
-                                        repo_id,
-                                        action
+                                        lambda: self.handler.handle_feedback(
+                                            user_id, repo_id, action,
+                                            dwell_seconds=dwell_seconds,
+                                        ),
                                     )
                                     processed_success = True
                                     

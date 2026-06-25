@@ -1,11 +1,12 @@
 import pytest
+import math
 import numpy as np
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from fastapi.testclient import TestClient
 
 from api.main import app
-from feedback.event_handlers import shift_vector, FeedbackHandler
+from feedback.event_handlers import shift_vector, FeedbackHandler, _dwell_alpha
 from feedback.producer import FeedbackProducer
 from feedback.consumer import FeedbackConsumer
 
@@ -115,11 +116,11 @@ def test_api_feedback_submission():
     """Verify FastAPI handles request validation and returns HTTP 202."""
     client = TestClient(app)
 
-    # Mock the producer to avoid hit Redis or async Queue queueing in testing
+    # Mock the producer to avoid hitting Redis or async Queue in testing
     with patch("api.main.producer") as mock_producer:
         mock_producer.submit_feedback = AsyncMock(return_value=True)
 
-        # Test valid request
+        # Test valid request (non-dwell action)
         response = client.post(
             "/api/v1/feedback",
             json={
@@ -130,11 +131,113 @@ def test_api_feedback_submission():
         )
         assert response.status_code == 202
         assert response.json()["status"] == "accepted"
+        # New signature includes dwell_seconds=None for non-dwell actions
         mock_producer.submit_feedback.assert_called_once_with(
             user_id="user_123",
             repo_id="facebook/react",
             action="like",
+            dwell_seconds=None,
         )
+
+
+def test_api_dwell_feedback_submission():
+    """Verify that a dwell event with dwell_seconds is accepted and threaded correctly."""
+    client = TestClient(app)
+
+    with patch("api.main.producer") as mock_producer:
+        mock_producer.submit_feedback = AsyncMock(return_value=True)
+
+        response = client.post(
+            "/api/v1/feedback",
+            json={
+                "user_id": "user_123",
+                "repo_id": "facebook/react",
+                "action": "dwell",
+                "dwell_seconds": 45.0,
+            },
+        )
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "accepted"
+        assert data["data"]["dwell_seconds"] == 45.0
+        mock_producer.submit_feedback.assert_called_once_with(
+            user_id="user_123",
+            repo_id="facebook/react",
+            action="dwell",
+            dwell_seconds=45.0,
+        )
+
+
+def test_api_dwell_missing_dwell_seconds():
+    """Verify dwell action without dwell_seconds returns HTTP 422."""
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/feedback",
+        json={
+            "user_id": "user_123",
+            "repo_id": "facebook/react",
+            "action": "dwell",
+        },
+    )
+    assert response.status_code == 422
+    assert "dwell_seconds" in response.json()["detail"]
+
+
+def test_dwell_alpha_boundary_cases():
+    """Verify _dwell_alpha boundary and monotonicity conditions."""
+    from config import MIN_DWELL_SECONDS, MAX_DWELL_SECONDS, DWELL_BASE_ALPHA
+
+    # Below threshold -> None (ignored, not an error)
+    assert _dwell_alpha(0.0) is None
+    assert _dwell_alpha(MIN_DWELL_SECONDS - 0.1) is None
+
+    # At threshold -> positive alpha
+    at_min = _dwell_alpha(MIN_DWELL_SECONDS)
+    assert at_min is not None
+    assert at_min > 0
+
+    # At max -> exactly DWELL_BASE_ALPHA (saturated)
+    assert pytest.approx(_dwell_alpha(MAX_DWELL_SECONDS), rel=1e-9) == DWELL_BASE_ALPHA
+
+    # Beyond max -> capped at DWELL_BASE_ALPHA
+    assert pytest.approx(_dwell_alpha(MAX_DWELL_SECONDS * 10), rel=1e-9) == DWELL_BASE_ALPHA
+
+    # All non-None values are in range (0, DWELL_BASE_ALPHA]
+    for secs in [MIN_DWELL_SECONDS, 10.0, 30.0, 120.0, MAX_DWELL_SECONDS]:
+        a = _dwell_alpha(secs)
+        assert a is not None
+        assert 0 < a <= DWELL_BASE_ALPHA + 1e-9
+
+    # Monotonicity: longer dwell -> larger alpha
+    alphas = [_dwell_alpha(s) for s in [MIN_DWELL_SECONDS, 10, 60, MAX_DWELL_SECONDS]]
+    for a1, a2 in zip(alphas, alphas[1:]):
+        assert a1 <= a2
+
+
+def test_handler_dwell_below_threshold_is_noop():
+    """Verify that a dwell shorter than MIN_DWELL_SECONDS does not touch Qdrant or Postgres."""
+    from config import MIN_DWELL_SECONDS
+
+    with patch("feedback.event_handlers.PostgreSQLConnector") as mock_db_cls, \
+         patch("feedback.event_handlers.QdrantClient") as mock_qdrant_cls:
+
+        mock_db = MagicMock()
+        mock_db.enabled = True
+        mock_db_cls.return_value = mock_db
+        mock_qdrant_cls.return_value = MagicMock()
+
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+
+        # A dwell of 1 second (below MIN_DWELL_SECONDS=3) should be a clean no-op
+        result = handler.handle_feedback(
+            "user_x", "owner/repo", "dwell", dwell_seconds=1.0
+        )
+
+        assert result is True  # not an error — just silently ignored
+        # No Postgres or Qdrant operations should have been triggered
+        mock_db.connect.assert_not_called()
+        handler.qdrant.upsert.assert_not_called()
 
 
 def test_api_invalid_action():
@@ -174,8 +277,10 @@ async def test_consumer_redis_loop_success():
     
     await consumer._redis_consume_loop()
     
-    # Verify handle_feedback was called
-    mock_handler.handle_feedback.assert_called_once_with("u1", "r1", "like")
+    # Verify handle_feedback was called with new dwell_seconds kwarg (None when not in payload)
+    mock_handler.handle_feedback.assert_called_once_with(
+        "u1", "r1", "like", dwell_seconds=None
+    )
     # Verify key was set in redis
     mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
     # Verify xack was called
@@ -239,7 +344,9 @@ async def test_consumer_redis_loop_retry_ack():
         await consumer._redis_consume_loop()
         assert mock_sleep.call_count == 2
         
-    mock_handler.handle_feedback.assert_called_once_with("u1", "r1", "like")
+    mock_handler.handle_feedback.assert_called_once_with(
+        "u1", "r1", "like", dwell_seconds=None
+    )
     # Verify set was called
     mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
     # xack called 3 times total

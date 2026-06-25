@@ -99,3 +99,34 @@ QDRANT_PAYLOAD_INDEX_FIELDS = [
     "updated_at",
     "pushed_at",
 ]
+
+# ── Dwell-time signal configuration ──────────────────────────────────────────
+# These constants control how observed dwell time on a repository card is
+# translated into an embedding learning-rate (alpha) for the vector shift.
+#
+#   MIN_DWELL_SECONDS  — dwells shorter than this are treated as accidental
+#                        scrolls and silently ignored (no embedding update).
+#   MAX_DWELL_SECONDS  — cap for the log-linear mapping; dwells beyond this
+#                        saturate at DWELL_BASE_ALPHA.
+#   DWELL_BASE_ALPHA   — maximum shift strength applied when a user reads a
+#                        repo card to completion (analogous to ACTION_WEIGHTS).
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float; got {raw!r}.") from exc
+
+MIN_DWELL_SECONDS: float = _float_env("MIN_DWELL_SECONDS", 3.0)
+MAX_DWELL_SECONDS: float = _float_env("MAX_DWELL_SECONDS", 300.0)
+DWELL_BASE_ALPHA:  float = _float_env("DWELL_BASE_ALPHA",  0.15)
+
+if MIN_DWELL_SECONDS < 0:
+    raise ValueError("MIN_DWELL_SECONDS must be non-negative.")
+if MAX_DWELL_SECONDS <= MIN_DWELL_SECONDS:
+    raise ValueError("MAX_DWELL_SECONDS must be greater than MIN_DWELL_SECONDS.")
+if not (0.0 < DWELL_BASE_ALPHA <= 1.0):
+    raise ValueError("DWELL_BASE_ALPHA must be in the range (0, 1].")

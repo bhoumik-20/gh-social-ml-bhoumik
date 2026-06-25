@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("pipeline.feedback.producer")
 
@@ -29,25 +29,41 @@ class FeedbackProducer:
                 logger.warning("Redis connection failed: %s. Falling back to In-Memory Queue.", exc)
                 self.redis_client = None
 
-    async def submit_feedback(self, user_id: str, repo_id: str, action: str) -> bool:
-        """Submit feedback event to the queue.
+    async def submit_feedback(
+        self,
+        user_id: str,
+        repo_id: str,
+        action: str,
+        *,
+        dwell_seconds: Optional[float] = None,
+    ) -> bool:
+        """Submit a feedback event to the processing queue.
 
-        Pushes to Redis Stream if available, otherwise falls back to the in-memory queue.
+        Pushes to Redis Stream if available, otherwise falls back to the
+        in-memory queue.  ``dwell_seconds`` is included in the event payload
+        when non-None so the consumer can resolve the embedding alpha.
         """
-        event = {
+        event: Dict[str, Any] = {
             "user_id": user_id,
             "repo_id": repo_id,
             "action": action,
         }
+        # The below conditional is for keeping the event compact — only
+        # dwell events carry this field; all other actions leave it absent.
+        if dwell_seconds is not None:
+            event["dwell_seconds"] = dwell_seconds
 
         if self.redis_client:
             try:
-                # Add to Redis Stream
-                self.redis_client.xadd("feedback_stream", event)
+                # Redis Stream values must all be strings
+                redis_event = {k: str(v) for k, v in event.items()}
+                self.redis_client.xadd("feedback_stream", redis_event)
                 logger.info("Published event to Redis Stream: %s", event)
                 return True
             except Exception as exc:
-                logger.error("Failed to publish to Redis Stream: %s. Falling back to In-Memory Queue.", exc)
+                logger.error(
+                    "Failed to publish to Redis Stream: %s. Falling back to In-Memory Queue.", exc
+                )
 
         # Fallback to in-memory queue
         await _in_memory_queue.put(event)
