@@ -234,7 +234,7 @@ class CandidateRetriever:
                 results.append({
                     "point_id": match["id"],
                     "repo_id": match["repo_id"],
-                    "full_name": match["repo_id"],
+                    "full_name": match.get("full_name") or match["repo_id"],
                     "score": match["score"],
                     "source": "semantic",
                 })

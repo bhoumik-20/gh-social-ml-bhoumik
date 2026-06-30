@@ -167,6 +167,7 @@ def build_vector_payload(
 
     return {
         "repo_id": repo_id,
+        "full_name": repo.get("full_name"),
         "html_url": repo.get("html_url"),
         "description": repo.get("description") or "",
         "primary_language": repo.get("primary_language") or "Unknown",

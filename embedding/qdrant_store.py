@@ -125,6 +125,7 @@ class QdrantRepositoryStore:
                     "id": str(point.id),
                     "score": float(point.score),
                     "repo_id": payload.get("repo_id"),
+                    "full_name": payload.get("full_name"),
                     "payload": payload,
                     "vector": point.vector if with_vectors else None,
                 }
