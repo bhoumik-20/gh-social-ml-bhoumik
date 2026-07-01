@@ -516,6 +516,10 @@ class UserOnboardingPipeline:
                 qdrant_url=qdrant_url,
                 qdrant_api_key=qdrant_api_key,
             )
+        except ValueError:
+            # Validation errors (empty profile, bad input, schema mismatch) must
+            # propagate so the API layer can return 422 instead of 500.
+            raise
         except Exception as exc:
             logger.error(f"User onboarding failed for '{user_id}': {exc}")
             return False

@@ -234,7 +234,7 @@ class CandidateRetriever:
                 results.append({
                     "point_id": match["id"],
                     "repo_id": match["repo_id"],
-                    "full_name": match["repo_id"],
+                    "full_name": match.get("full_name") or match["repo_id"],
                     "score": match["score"],
                     "source": "semantic",
                 })
@@ -465,6 +465,9 @@ class CandidateRetriever:
                 "retrieval_score": candidate.get("score"),
             }
 
+            if pid and pid in embedding_map:
+                entry.update(embedding_map[pid].get("payload") or {})
+
             # Merge PostgreSQL metadata
             if name and name in metadata_map:
                 entry.update(metadata_map[name])
@@ -473,7 +476,7 @@ class CandidateRetriever:
 
             # Attach embedding vector — or mark for on-the-fly generation
             if pid and pid in embedding_map:
-                entry["repo_embedding"] = embedding_map[pid]
+                entry["repo_embedding"] = embedding_map[pid]["vector"]
                 entry["embedding_source"] = "qdrant"
             else:
                 # No Qdrant point (typical for trending-only repos).
@@ -502,9 +505,14 @@ class CandidateRetriever:
                     exc, len(needs_embedding),
                 )
                 for _, entry in needs_embedding:
-                    if entry["repo_embedding"] is None:
+                    if entry.get("repo_embedding") is None:
                         entry["repo_embedding"] = [0.0] * EMBEDDING_DIM
                         entry["embedding_source"] = "zero_fallback"
+            
+            # Persist successful on-the-fly embeddings
+            successful_embeddings = [entry for _, entry in needs_embedding if entry.get("embedding_source") == "on_the_fly"]
+            if successful_embeddings:
+                self._persist_on_the_fly_embeddings(successful_embeddings)
 
         return hydrated
 
@@ -674,11 +682,61 @@ class CandidateRetriever:
             logger.warning("Supplemental trending metadata fetch failed: %s", exc)
             return {}
 
+    def _persist_on_the_fly_embeddings(self, entries: list[dict[str, Any]]) -> None:
+        """Persist generated trending embeddings to Qdrant for future retrieval."""
+        if not entries or self._qdrant_store is None:
+            return
+
+        points = []
+        for entry in entries:
+            repo_name = entry.get("full_name") or entry.get("repo_id")
+            vector = entry.get("repo_embedding")
+            if not repo_name or not isinstance(vector, list):
+                continue
+
+            payload = {
+                "repo_id": repo_name,
+                "html_url": entry.get("github_repo_url"),
+                "description": entry.get("description") or "",
+                "primary_language": entry.get("primary_language") or "Unknown",
+                "languages": entry.get("languages") or [],
+                "topics": entry.get("topics") or [],
+                "star_count": int(entry.get("star_count") or 0),
+                "fork_count": int(entry.get("forks_count") or entry.get("fork_count") or 0),
+                "open_issues_count": int(entry.get("open_issues_count") or 0),
+                "doc_quality": float(entry.get("doc_quality") or 0.5),
+                "code_health": float(entry.get("code_health") or 0.5),
+                "activity_score": float(entry.get("activity_score") or 0.0),
+                "trend_velocity": float(entry.get("trend_velocity") or 0.0),
+                "trending_rank": entry.get("trending_rank"),
+                "embedding_source": "on_the_fly",
+            }
+
+            points.append(
+                self._qdrant_store.models.PointStruct(
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_name}")),
+                    vector={QDRANT_VECTOR_NAME: vector},
+                    payload=payload,
+                )
+            )
+
+        if not points:
+            return
+
+        try:
+            self._qdrant_store.client.upsert(
+                collection_name=QDRANT_COLLECTION_NAME,
+                points=points,
+            )
+            logger.info("Persisted %d on-the-fly trending embeddings to Qdrant.", len(points))
+        except Exception as exc:
+            logger.warning("Could not persist on-the-fly trending embeddings: %s", exc)
+
     def _batch_fetch_embeddings(
         self,
         point_ids: list[str],
-    ) -> dict[str, list[float]]:
-        """Fetch embedding vectors from Qdrant for a batch of point IDs."""
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch embedding vectors and payloads from Qdrant for a batch of point IDs."""
         if not point_ids or self._qdrant_store is None:
             return {}
 
@@ -688,10 +746,10 @@ class CandidateRetriever:
                 collection_name=QDRANT_COLLECTION_NAME,
                 ids=point_ids,
                 with_vectors=True,
-                with_payload=False,
+                with_payload=True,
             )
 
-            embedding_map: dict[str, list[float]] = {}
+            embedding_map: dict[str, dict[str, Any]] = {}
             for point in points:
                 vec = point.vector
                 # Handle named vectors (collection may store vectors under a name)
@@ -699,7 +757,10 @@ class CandidateRetriever:
                     vec = vec.get(QDRANT_VECTOR_NAME, [0.0] * EMBEDDING_DIM)
                 if vec is None:
                     vec = [0.0] * EMBEDDING_DIM
-                embedding_map[str(point.id)] = list(vec)
+                embedding_map[str(point.id)] = {
+                    "vector": list(vec),
+                    "payload": point.payload or {},
+                }
 
             logger.info(
                 "Embedding hydration: %d/%d point IDs retrieved from Qdrant.",
