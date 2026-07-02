@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 # Resolve project root
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -9,7 +10,9 @@ if _ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()
 
+from database import PostgreSQLConnector
 from utils.gemma_client import generate_readme_markdown
+from utils.readme_processor import process_markdown
 
 def main():
     print("🚀 Running Gemma README Markdown Generation Test...")
@@ -20,29 +23,41 @@ def main():
         print("Please add it to your .env: GEMINI_API_KEY=your_key_here")
         return
         
-    print(f"API Key detected. Using model: {os.getenv('GEMMA_MODEL_ID', 'gemma-4-E4B-it')}")
+    print(f"API Key detected. Using model: {os.getenv('GEMMA_MODEL_ID', 'gemini-2.5-flash')}")
     
-    mock_clean_text = (
-        "project name: osiris-lite\n\n"
-        "description: this is a fast lightweight library for building vector embeddings "
-        "and performing similarity search on python data dictionaries.\n\n"
-        "features:\n"
-        "- simple and fast\n"
-        "- persistent storage support\n"
-        "- zero runtime dependencies except requests\n\n"
-        "how to run:\n"
-        "run python3 main.py with appropriate options."
-    )
-    
-    print("\n--- Input Clean Text ---")
-    print(mock_clean_text)
-    print("------------------------")
+    # Retrieve langflow description/summary from Supabase
+    db = PostgreSQLConnector()
+    if not db.enabled or not db.verify_connection():
+        print("❌ Error: Could not connect to database.")
+        return
+
+    print("Fetching 'langflow-ai/langflow' description from Supabase...")
+    conn = db.connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT description, readme_summary FROM Repo WHERE full_name = 'langflow-ai/langflow';")
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not row:
+        print("❌ Error: langflow repo not found in database. Using default fallback description.")
+        raw_text = "Langflow is a powerful, low-code interface for building RAG applications and AI agents."
+    else:
+        description, readme_summary = row
+        raw_text = readme_summary or description
+
+    # Process and clean text
+    clean_text = process_markdown(raw_text).clean_text
+    print(f"Source text size: {len(clean_text)} characters.")
     
     print("\nCalling Gemma model via Gemini Cloud API (this may take a few seconds)...")
-    markdown_out = generate_readme_markdown(mock_clean_text)
+    start_time = time.time()
+    markdown_out = generate_readme_markdown(clean_text[:3000])
+    duration = time.time() - start_time
     
     if markdown_out:
         print("\n✅ SUCCESS: Gemma generated the following Markdown:")
+        print(f"  - Request Duration: {duration:.2f} seconds")
         print("------------------------")
         print(markdown_out)
         print("------------------------")
@@ -51,3 +66,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
