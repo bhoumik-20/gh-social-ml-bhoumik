@@ -4,31 +4,27 @@ import pytest
 import requests
 
 from utils.readme_processor import ReadmeDocument, process_markdown
-from utils.gemma_client import generate_readme_markdown
+from utils.groq_client import generate_readme_markdown
 from acquisition.repository_enricher import EnrichmentResult, RepositoryEnricher
 from database.connector import PostgreSQLConnector
 
 
 @pytest.mark.unit
-class TestGemmaReadmeMarkdown:
-    """Unit tests for Gemma README Markdown generation."""
+class TestGroqReadmeMarkdown:
+    """Unit tests for Groq README Markdown generation."""
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key", "GEMINI_API_URL": "https://api.test.com", "GEMMA_MODEL_ID": "gemma-4-26b-a4b-it"})
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key", "GROQ_MODEL_ID": "llama-3.3-70b-versatile"})
     @patch("requests.post")
     def test_generate_readme_markdown_success(self, mock_post):
-        """Test successful markdown generation using the Gemma client."""
-        # Setup mock response from Gemini API
+        """Test successful markdown generation using the Groq client."""
+        # Setup mock response from Groq API
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
-            "candidates": [
+            "choices": [
                 {
-                    "content": {
-                        "parts": [
-                            {
-                                "text": "# Cool Project\nThis is a cool project."
-                            }
-                        ]
+                    "message": {
+                        "content": "# Cool Project\nThis is a cool project."
                     }
                 }
             ]
@@ -42,28 +38,26 @@ class TestGemmaReadmeMarkdown:
         assert result == "# Cool Project\nThis is a cool project."
         mock_post.assert_called_once()
         called_url = mock_post.call_args[0][0]
-        assert "api.test.com/models/gemma-4-26b-a4b-it:generateContent" in called_url
-        assert "key=test_key" in called_url
+        assert "api.groq.com/openai/v1/chat/completions" in called_url
+        
+        called_headers = mock_post.call_args[1]["headers"]
+        assert called_headers["Authorization"] == "Bearer test_key"
         
         called_payload = mock_post.call_args[1]["json"]
-        assert "contents" in called_payload
-        assert clean_text in called_payload["contents"][0]["parts"][0]["text"]
+        assert called_payload["model"] == "llama-3.3-70b-versatile"
+        assert clean_text in called_payload["messages"][0]["content"]
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
     @patch("requests.post")
     def test_generate_readme_markdown_strips_code_fences(self, mock_post):
-        """Test that the Gemma client cleans up markdown block wrappers from the model output."""
+        """Test that the Groq client cleans up markdown block wrappers from the model output."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
-            "candidates": [
+            "choices": [
                 {
-                    "content": {
-                        "parts": [
-                            {
-                                "text": "```markdown\n# Project Title\n\n- Bullet list\n```"
-                            }
-                        ]
+                    "message": {
+                        "content": "```markdown\n# Project Title\n\n- Bullet list\n```"
                     }
                 }
             ]
@@ -81,7 +75,7 @@ class TestGemmaReadmeMarkdown:
             result = generate_readme_markdown("Clean text")
             assert result == ""
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
     @patch("requests.post")
     def test_generate_readme_markdown_timeout_graceful(self, mock_post):
         """Test that HTTP timeouts are handled gracefully without raising exceptions."""
@@ -90,7 +84,7 @@ class TestGemmaReadmeMarkdown:
         result = generate_readme_markdown("Clean text")
         assert result == ""
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
     @patch("requests.post")
     def test_generate_readme_markdown_http_error_graceful(self, mock_post):
         """Test that HTTP errors (e.g. 500) are handled gracefully."""
@@ -102,19 +96,19 @@ class TestGemmaReadmeMarkdown:
         result = generate_readme_markdown("Clean text")
         assert result == ""
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"})
-    @patch("utils.gemma_client.rate_limiter")
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
+    @patch("utils.groq_client.rate_limiter")
     @patch("time.sleep")
     @patch("requests.post")
     def test_generate_readme_markdown_retry_on_429_success(self, mock_post, mock_sleep, mock_limiter):
-        """Test that the Gemma client retries on HTTP 429 and eventually succeeds."""
+        """Test that the Groq client retries on HTTP 429 and eventually succeeds."""
         mock_response_429 = MagicMock()
         mock_response_429.status_code = 429
         
         mock_response_200 = MagicMock()
         mock_response_200.status_code = 200
         mock_response_200.json.return_value = {
-            "candidates": [{"content": {"parts": [{"text": "# Success"}]}}]
+            "choices": [{"message": {"content": "# Success"}}]
         }
         
         mock_post.side_effect = [mock_response_429, mock_response_200]
@@ -125,12 +119,12 @@ class TestGemmaReadmeMarkdown:
         assert mock_post.call_count == 2
         mock_sleep.assert_called_with(2.0)
 
-    @patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"})
-    @patch("utils.gemma_client.rate_limiter")
+    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
+    @patch("utils.groq_client.rate_limiter")
     @patch("time.sleep")
     @patch("requests.post")
     def test_generate_readme_markdown_retry_on_429_exhausted(self, mock_post, mock_sleep, mock_limiter):
-        """Test that the Gemma client exhausts retries on HTTP 429 and returns empty string."""
+        """Test that the Groq client exhausts retries on HTTP 429 and returns empty string."""
         mock_response_429 = MagicMock()
         mock_response_429.status_code = 429
         mock_post.return_value = mock_response_429
@@ -144,9 +138,9 @@ class TestGemmaReadmeMarkdown:
     @patch("time.sleep")
     @patch("time.time")
     def test_rate_limiter_spacing(self, mock_time, mock_sleep):
-        """Test that the GeminiRateLimiter spaces out consecutive requests properly."""
-        from utils.gemma_client import GeminiRateLimiter
-        limiter = GeminiRateLimiter(rpm_limit=15.0)  # 4s spacing
+        """Test that the GroqRateLimiter spaces out consecutive requests properly."""
+        from utils.groq_client import GroqRateLimiter
+        limiter = GroqRateLimiter(rpm_limit=15.0)  # 4s spacing
         
         mock_time.return_value = 100.0
         limiter.wait_if_needed()

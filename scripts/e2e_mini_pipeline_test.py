@@ -108,14 +108,14 @@ def step_gemma_enrichment(kept: list) -> list:
     print("  STEP 3 — Gemma README Markdown Enrichment")
     print(DIVIDER)
 
-    from utils.gemma_client import generate_readme_markdown
+    from utils.groq_client import generate_readme_markdown
     from utils.readme_processor import process_markdown
 
     for r in kept:
         p = r.payload
         raw_readme = p.get("readme", "") or p.get("readme_summary", "") or p.get("description", "")
         if not raw_readme:
-            logger.warning("No README content for %s — skipping Gemma enrichment.", r.repo_id)
+            logger.warning("No README content for %s — skipping Groq enrichment.", r.repo_id)
             continue
 
         # Clean raw text first
@@ -124,13 +124,13 @@ def step_gemma_enrichment(kept: list) -> list:
             logger.warning("ReadmeProcessor returned empty clean_text for %s.", r.repo_id)
             continue
 
-        # Generate structured Markdown via Gemini API
+        # Generate structured Markdown via Groq API
         md = generate_readme_markdown(clean_text[:3000])   # cap to avoid huge token usage
         if md:
             p["readme_markdown"] = md
-            logger.info("✅ Gemma generated Markdown for %s (%d chars).", r.repo_id, len(md))
+            logger.info("✅ Groq generated Markdown for %s (%d chars).", r.repo_id, len(md))
         else:
-            logger.warning("Gemma returned empty result for %s.", r.repo_id)
+            logger.warning("Groq returned empty result for %s.", r.repo_id)
 
     return kept
 
@@ -385,7 +385,7 @@ def display_results(batches: dict, db) -> None:
                 # README Markdown section
                 readme_md = meta.get("readme_markdown", "").strip()
                 if readme_md:
-                    print(f"\n  📝  README (Gemma Formatted Markdown):")
+                    print(f"\n  📝  README (Groq Formatted Markdown):")
                     print(f"  {'·' * 60}")
                     # Print the first 25 lines of the Markdown for readability
                     md_lines = readme_md.splitlines()
@@ -395,7 +395,7 @@ def display_results(batches: dict, db) -> None:
                         print(f"      ... [{len(md_lines) - 25} more lines]")
                     print(f"  {'·' * 60}")
                 else:
-                    print(f"\n  📝  README (Gemma Formatted Markdown): ⚠️  Not generated yet")
+                    print(f"\n  📝  README (Groq Formatted Markdown): ⚠️  Not generated yet")
                     summary = meta.get("readme_summary", "").strip()
                     if summary:
                         print(f"  Raw README Summary: {summary[:300]}")

@@ -10,7 +10,7 @@ import logging
 
 from .github_graphql_client import GitHubGraphQLClient
 from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
-from utils.gemma_client import generate_readme_markdown
+from utils.groq_client import generate_readme_markdown
 
 logger = logging.getLogger(__name__)
 

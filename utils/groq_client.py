@@ -7,9 +7,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-class GeminiRateLimiter:
-    """Thread-safe rate limiter to prevent exceeding the Gemini/Gemma API requests-per-minute (RPM) quota."""
-    def __init__(self, rpm_limit: float = 15.0):
+class GroqRateLimiter:
+    """Thread-safe rate limiter to prevent exceeding the Groq API requests-per-minute (RPM) quota."""
+    def __init__(self, rpm_limit: float = 100.0):
         self.rpm_limit = rpm_limit
         self.lock = threading.Lock()
         self.last_request_time = 0.0
@@ -29,34 +29,33 @@ class GeminiRateLimiter:
             self.last_request_time = time.time()
 
 
-# Instantiate a global rate limiter. Default to 15 RPM (typical free tier constraint)
-_RPM_LIMIT = float(os.getenv("GEMINI_RPM_LIMIT", "15"))
-rate_limiter = GeminiRateLimiter(rpm_limit=_RPM_LIMIT)
+# Instantiate a global rate limiter. Default to 100 RPM for paid Groq accounts
+_RPM_LIMIT = float(os.getenv("GROQ_RPM_LIMIT", "100"))
+rate_limiter = GroqRateLimiter(rpm_limit=_RPM_LIMIT)
 
 
 def generate_readme_markdown(clean_text: str) -> str:
     """
     Generate a clean, structured Markdown document from the cleaned README plain text
-    using the Gemma 4 E4B model. Enforces rate limits and automatically retries with 
-    exponential backoff on HTTP 429 (Resource Exhausted).
+    using the Groq Llama-3.3-70b model. Enforces rate limits and automatically retries with 
+    exponential backoff on HTTP 429.
     """
     if not clean_text or not clean_text.strip():
         return ""
 
-    # Load environment variables
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEMMA_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    api_url = os.getenv("GEMINI_API_URL") or "https://generativelanguage.googleapis.com/v1beta"
-    model = os.getenv("GEMMA_MODEL_ID") or "gemma-4-26b-a4b-it"
+    api_key = os.getenv("GROQ_API_KEY")
+    model = os.getenv("GROQ_MODEL_ID") or "llama-3.3-70b-versatile"
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
     if not api_key:
         logger.warning(
-            "No API key found for Gemma README Markdown generation. "
-            "Please set GEMINI_API_KEY, GEMMA_API_KEY, or GOOGLE_API_KEY in the environment. "
-            "Skipping Markdown generation."
+            "No GROQ_API_KEY found in the environment. "
+            "Skipping README markdown generation."
         )
         return ""
 
     headers = {
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     
@@ -73,22 +72,16 @@ def generate_readme_markdown(clean_text: str) -> str:
     )
 
     payload = {
-        "contents": [
+        "model": model,
+        "messages": [
             {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
+                "role": "user",
+                "content": prompt
             }
         ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 4096
-        }
+        "temperature": 0.1
     }
 
-    url = f"{api_url.rstrip('/')}/models/{model}:generateContent?key={api_key}"
     max_retries = 3
     backoff_factor = 2.0
 
@@ -97,14 +90,14 @@ def generate_readme_markdown(clean_text: str) -> str:
         rate_limiter.wait_if_needed()
 
         try:
-            logger.info(f"Generating README markdown using Gemma model '{model}' via Cloud API (Attempt {attempt + 1}/{max_retries + 1})...")
-            # Set a 60-second timeout to accommodate model reasoning/thoughts latency
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            logger.info(f"Generating README markdown using Groq model '{model}' (Attempt {attempt + 1}/{max_retries + 1})...")
+            # Set a 45-second timeout to accommodate model reasoning/latency
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
             
             if response.status_code == 200:
                 res_json = response.json()
                 try:
-                    text_out = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    text_out = res_json["choices"][0]["message"]["content"].strip()
                     # Clean up potential markdown code fences wrapping the response
                     if text_out.startswith("```"):
                         text_out = re.sub(r"^```[a-zA-Z]*\n?", "", text_out)
@@ -112,30 +105,30 @@ def generate_readme_markdown(clean_text: str) -> str:
                             text_out = text_out[:-3].strip()
                     return text_out.strip()
                 except (KeyError, IndexError) as e:
-                    logger.error(f"Failed to parse Gemini API response payload: {e}")
+                    logger.error(f"Failed to parse Groq API response payload: {e}")
                     return ""
             
             elif response.status_code == 429:
                 if attempt < max_retries:
                     sleep_time = backoff_factor ** attempt * 2.0
-                    logger.warning(f"Gemini API rate limit exceeded (HTTP 429). Retrying in {sleep_time}s...")
+                    logger.warning(f"Groq API rate limit exceeded (HTTP 429). Retrying in {sleep_time}s...")
                     time.sleep(sleep_time)
                     continue
                 else:
-                    logger.error("Gemini API rate limit exceeded (HTTP 429) and max retries exhausted.")
+                    logger.error("Groq API rate limit exceeded (HTTP 429) and max retries exhausted.")
                     return ""
             
             else:
-                logger.error(f"Gemini API returned error status {response.status_code}: {response.text}")
+                logger.error(f"Groq API returned error status {response.status_code}: {response.text}")
                 return ""
                 
         except Exception as exc:
             if attempt < max_retries:
-                logger.warning(f"Error calling Gemini API: {exc}. Retrying...")
+                logger.warning(f"Error calling Groq API: {exc}. Retrying...")
                 time.sleep(1.0)
                 continue
             else:
-                logger.error(f"Error calling Gemini API after max retries: {exc}")
+                logger.error(f"Error calling Groq API after max retries: {exc}")
                 return ""
     
     return ""
