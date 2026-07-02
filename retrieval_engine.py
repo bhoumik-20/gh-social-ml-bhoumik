@@ -380,29 +380,33 @@ class RetrievalEngine:
                 ORDER BY trending_rank ASC
                 LIMIT %s;
                 """
-                cursor.execute(query_trending, (trending_limit,))
-                for row in cursor.fetchall():
-                    full_name = row[0]
-                    if full_name not in seen_repos:
-                        seen_repos.add(full_name)
-                        topics = row[3]
-                        if isinstance(topics, str):
-                            try:
-                                topics = json.loads(topics)
-                            except Exception:
-                                topics = []
-                        candidates.append({
-                            "repo_id": full_name,
-                            "full_name": full_name,
-                            "github_repo_url": row[6] or f"https://github.com/{full_name}",
-                            "description": row[1] or "",
-                            "primary_language": row[2] or "Unknown",
-                            "topics": topics or [],
-                            "languages": [],
-                            "star_count": row[4] or 0,
-                            "forks_count": row[5] or 0,
-                            "source": "cold_start_trending",
-                        })
+                try:
+                    cursor.execute(query_trending, (trending_limit,))
+                    for row in cursor.fetchall():
+                        full_name = row[0]
+                        if full_name not in seen_repos:
+                            seen_repos.add(full_name)
+                            topics = row[3]
+                            if isinstance(topics, str):
+                                try:
+                                    topics = json.loads(topics)
+                                except Exception:
+                                    topics = []
+                            candidates.append({
+                                "repo_id": full_name,
+                                "full_name": full_name,
+                                "github_repo_url": row[6] or f"https://github.com/{full_name}",
+                                "description": row[1] or "",
+                                "primary_language": row[2] or "Unknown",
+                                "topics": topics or [],
+                                "languages": [],
+                                "star_count": row[4] or 0,
+                                "forks_count": row[5] or 0,
+                                "source": "cold_start_trending",
+                            })
+                except Exception as exc:
+                    logger.warning("Failed to fetch trending repositories: %s", type(exc).__name__)
+                    conn.rollback()
 
             # 3. Ultimate Fallback (Any Local Repos)
             if len(candidates) < (BATCH_SIZE * NUM_BATCHES):
@@ -413,15 +417,17 @@ class RetrievalEngine:
                        forks_count, github_repo_url
                 FROM repo
                 ORDER BY RANDOM()
-                LIMIT %s;
+                LIMIT 100;
                 """
-                cursor.execute(query_any, (remaining_needed,))
+                cursor.execute(query_any)
                 columns = [
                     "repo_id", "full_name", "description", "repo_name",
                     "language_used", "topics", "readme_summary", "star_count",
                     "forks_count", "github_repo_url"
                 ]
                 for row in cursor.fetchall():
+                    if len(candidates) >= (BATCH_SIZE * NUM_BATCHES):
+                        break
                     row_dict = dict(zip(columns, row))
                     if row_dict["full_name"] not in seen_repos:
                         seen_repos.add(row_dict["full_name"])
