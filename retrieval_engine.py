@@ -354,6 +354,13 @@ class RetrievalEngine:
                             langs = list(langs.keys())
                         elif not isinstance(langs, list):
                             langs = []
+                        topics = row_dict["topics"]
+                        if isinstance(topics, str):
+                            try:
+                                topics = json.loads(topics)
+                            except Exception:
+                                topics = []
+                        
                         candidates.append({
                             "repo_id": str(row_dict["repo_id"]),
                             "full_name": row_dict["full_name"],
@@ -362,7 +369,7 @@ class RetrievalEngine:
                             "description": row_dict["description"],
                             "primary_language": langs[0] if langs else "Unknown",
                             "languages": langs,
-                            "topics": row_dict["topics"] if isinstance(row_dict["topics"], list) else [],
+                            "topics": topics if isinstance(topics, list) else [],
                             "star_count": row_dict["star_count"],
                             "forks_count": row_dict["forks_count"],
                             "source": "cold_start_skills",
@@ -441,6 +448,13 @@ class RetrievalEngine:
                             langs = list(langs.keys())
                         elif not isinstance(langs, list):
                             langs = []
+                        topics = row_dict["topics"]
+                        if isinstance(topics, str):
+                            try:
+                                topics = json.loads(topics)
+                            except Exception:
+                                topics = []
+
                         candidates.append({
                             "repo_id": str(row_dict["repo_id"]),
                             "full_name": row_dict["full_name"],
@@ -449,7 +463,7 @@ class RetrievalEngine:
                             "description": row_dict["description"],
                             "primary_language": langs[0] if langs else "Unknown",
                             "languages": langs,
-                            "topics": row_dict["topics"] if isinstance(row_dict["topics"], list) else [],
+                            "topics": topics if isinstance(topics, list) else [],
                             "star_count": row_dict["star_count"],
                             "forks_count": row_dict["forks_count"],
                             "source": "cold_start_fallback",
