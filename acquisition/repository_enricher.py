@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
+import re
 from typing import Any
 import logging
 
 from .github_graphql_client import GitHubGraphQLClient
 from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
-from utils.groq_client import generate_readme_markdown
+from utils.openrouter_client import generate_readme_md
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +117,11 @@ class RepositoryEnricher:
             if readme_text:
                 readme = process_markdown(readme_text)
                 if readme.clean_text:
-                    readme.readme_markdown = generate_readme_markdown(readme.clean_text)
+                    readme.readme_md = generate_readme_md(readme.clean_text)
                 # Patch the result with the real README data
                 result.readme = readme
                 result.payload["readme_length"] = readme.readme_length
-                result.payload["readme_markdown"] = readme.readme_markdown
+                result.payload["readme_md"] = readme.readme_md
                 result.payload["extracted_paragraphs"] = readme.extracted_paragraphs
                 result.payload["readme_to_codebase_ratio"] = self._readme_to_codebase_ratio(
                     readme.readme_length, int(result.raw_repository.get("size") or 0)
@@ -183,7 +184,7 @@ class RepositoryEnricher:
         } if readme_text else None
         readme = process_readme_payload(readme_payload)
         if readme.clean_text:
-            readme.readme_markdown = generate_readme_markdown(readme.clean_text)
+            readme.readme_md = generate_readme_md(readme.clean_text)
 
         # Star history and events approximation
         stargazers = [{"starred_at": edge.get("starredAt")} for edge in data.get("stargazers", {}).get("edges", [])]
@@ -268,12 +269,18 @@ class RepositoryEnricher:
         pushed_days_ago = self._days_since(repository.get("pushed_at"))
         deltas = self._estimate_star_deltas(repository, stargazers=stargazers, events=events)
 
+        primary_lang_str = primary_language or "Unknown"
+        special_label = None
+        if primary_lang_str == "Unknown":
+            special_label = self._classify_unknown_repo(repository.get("description"), topics)
+
         return {
             "id": full_name,
             "star_count": int(repository.get("stargazers_count") or repository.get("watchers_count") or 0),
-            "primary_language": primary_language or "Unknown",
+            "primary_language": primary_lang_str,
+            "special_label": special_label,
             "readme_length": readme.readme_length,
-            "readme_markdown": readme.readme_markdown,
+            "readme_md": readme.readme_md,
             "readme_to_codebase_ratio": self._readme_to_codebase_ratio(readme.readme_length, size_kb),
             "mentionable_users_count": self._mentionable_users_count(contributors, repository),
             "delta_3d": deltas[3],
@@ -295,6 +302,28 @@ class RepositoryEnricher:
             "recent_commits": recent_commits or [],
         }
 
+
+    @staticmethod
+    def _classify_unknown_repo(description: str | None, topics: list[str]) -> str:
+        text_to_search = f"{description or ''} {' '.join(topics or [])}".lower()
+        
+        heuristics = [
+            ("list", r"\b(list|awesome|collection|resources|books)\b"),
+            ("roadmap", r"\b(roadmap|path|curriculum|syllabus|career|interview)\b"),
+            ("tutorial", r"\b(tutorial|build-your-own|step-by-step)\b"),
+            ("explainer", r"\b(explain|how-to|notes|learn|course|guide|concepts|primer)\b"),
+            ("cheatsheet", r"\b(cheatsheet|cheat-sheet|reference|quick-look)\b"),
+            ("dataset", r"\b(dataset|data|corpus|apis)\b"),
+            ("template", r"\b(template|boilerplate|starter|scaffold|scaffolding)\b"),
+            ("spec", r"\b(rfc|spec|specification|standard|protocol)\b"),
+            ("showcase", r"\b(showcase|portfolio|gallery|examples|demos)\b"),
+        ]
+        
+        for label, pattern in heuristics:
+            if re.search(pattern, text_to_search):
+                return label
+                
+        return "other"
 
     @staticmethod
     def _primary_language(languages: dict[str, int]) -> str | None:

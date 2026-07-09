@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import requests
-import json
 
 # Ensure project root is in the path
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -13,58 +12,40 @@ if _ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()
 
-from database import PostgreSQLConnector
 from utils.readme_processor import process_markdown
 
 def main():
-    print("🚀 Groq API Inference Test Script")
-    print("=================================")
+    print("🚀 OpenRouter API Inference Test Script")
+    print("=======================================")
 
     # 1. Check for API key
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        print("❌ Error: GROQ_API_KEY not found in environment.")
-        print("Please add 'GROQ_API_KEY=your_key_here' to your .env file.")
+        print("❌ Error: OPENROUTER_API_KEY not found in environment.")
+        print("Please add 'OPENROUTER_API_KEY=your_key_here' to your .env file.")
         return
 
-    # 2. Retrieve repository description/summary from Supabase
-    target_repo = sys.argv[1] if len(sys.argv) > 1 else "FunAudioLLM/CosyVoice"
+    # 2. Use a dummy text instead of querying the DB since DB is empty
+    print("Using a test string as the source README text...")
+    raw_text = """
+    # Dummy Repo
     
-    db = PostgreSQLConnector()
-    if not db.enabled or not db.verify_connection():
-        print("❌ Error: Could not connect to database.")
-        return
-
-    print(f"Fetching '{target_repo}' description from Supabase...")
-    conn = db.connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT description, readme_summary FROM Repo WHERE full_name = %s OR repo_name = %s LIMIT 1;",
-        (target_repo, target_repo)
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-
-    if not row:
-        print(f"❌ Error: Repository '{target_repo}' not found in database. Using fallback description.")
-        raw_text = f"Repository {target_repo} is a high-quality open-source project."
-    else:
-        description, readme_summary = row
-        raw_text = readme_summary or description
+    This is a test repository.
+    
+    ## Installation
+    `pip install dummy`
+    
+    ## Usage
+    Run the dummy script to do dummy things.
+    """
 
     # Process and clean text
     clean_text = process_markdown(raw_text).clean_text
     print(f"Source text size: {len(clean_text)} characters.")
 
-    # 3. Formulate Groq prompt and payload
-    model = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-specdec")
-    # Fallback to standard Groq model if specialized decoder not specified
-    if model == "llama-3.3-70b-specdec":
-        # Check standard model list: llama-3.3-70b-versatile, llama-3.1-8b-instant, gemma2-9b-it
-        model = "llama-3.3-70b-versatile"
-        
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    # 3. Formulate OpenRouter prompt and payload
+    model = os.getenv("OPENROUTER_MODEL_ID", "meta-llama/llama-3.3-70b-instruct")
+    url = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
     
     prompt = (
         "You are an expert technical writer. Convert the following plain text version of a GitHub repository README "
@@ -80,7 +61,9 @@ def main():
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("CLIENT_URL") or "http://localhost:8081",
+        "X-Title": "GH Social ML Test",
     }
 
     payload = {
@@ -94,7 +77,7 @@ def main():
         "temperature": 0.1
     }
 
-    print(f"\nSending inference request to Groq (Model: {model})...")
+    print(f"\nSending inference request to OpenRouter (Model: {model})...")
     start_time = time.time()
     
     try:
@@ -114,7 +97,7 @@ def main():
                 prompt_tokens = usage.get("prompt_tokens", 0)
                 print(f"  - Completion Tokens: {completion_tokens}")
                 print(f"  - Prompt Tokens: {prompt_tokens}")
-                if duration > 0:
+                if duration > 0 and completion_tokens > 0:
                     print(f"  - Throughput: {completion_tokens / duration:.1f} tokens/second")
 
             print("\n📝 Generated README Markdown:")
@@ -123,7 +106,7 @@ def main():
             print("-------------------------------------")
             
         else:
-            print(f"❌ Error: Groq API returned status {response.status_code}")
+            print(f"❌ Error: OpenRouter API returned status {response.status_code}")
             print(response.text)
             
     except Exception as e:

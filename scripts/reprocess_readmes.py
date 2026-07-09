@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import PostgreSQLConnector
-from utils.groq_client import generate_readme_markdown
+from utils.openrouter_client import generate_readme_md
 
 def main():
     print("🚀 Starting Reprocess READMEs Test Script...")
@@ -23,8 +23,8 @@ def main():
         
     db.init_db()
     
-    # 2. Fetch 3 repositories that don't have readme_markdown populated yet
-    print("Fetching up to 3 repositories from Supabase with empty 'readme_markdown'...")
+    # 2. Fetch 3 repositories that don't have readme_md populated yet
+    print("Fetching up to 3 repositories from Supabase with empty 'readme_md'...")
     conn = db.connect()
     cursor = conn.cursor()
     
@@ -33,13 +33,13 @@ def main():
         cursor.execute(
             "SELECT repo_id, full_name, description, readme_summary "
             "FROM Repo "
-            "WHERE readme_markdown IS NULL OR readme_markdown = '' "
+            "WHERE readme_md IS NULL OR readme_md = '' "
             "LIMIT 3;"
         )
         repos = cursor.fetchall()
         
         if not repos:
-            print("No repositories found with empty 'readme_markdown'. Fetching 3 random repositories instead...")
+            print("No repositories found with empty 'readme_md'. Fetching 3 random repositories instead...")
             cursor.execute(
                 "SELECT repo_id, full_name, description, readme_summary "
                 "FROM Repo "
@@ -63,7 +63,7 @@ def main():
                 source_text = f"Repository {full_name} is a GitHub project."
                 
             print(f"Generating Markdown from text (length {len(source_text)} chars)...")
-            markdown_out = generate_readme_markdown(source_text)
+            markdown_out = generate_readme_md(source_text)
             
             if markdown_out:
                 print(f"✅ Generated {len(markdown_out)} chars of structured Markdown.")
@@ -71,7 +71,7 @@ def main():
                 # Update row in database
                 cursor.execute(
                     "UPDATE Repo "
-                    "SET readme_markdown = %s, updated_at = NOW() "
+                    "SET readme_md = %s, updated_at = NOW() "
                     "WHERE repo_id = %s;",
                     (markdown_out, repo_id)
                 )
