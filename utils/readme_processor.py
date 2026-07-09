@@ -30,7 +30,7 @@ class ReadmeDocument:
     clean_text: str
     extracted_paragraphs: list[str]
     readme_length: int
-    readme_markdown: str = ""
+    readme_md: str = ""
 
 
 def decode_readme_payload(payload: dict[str, Any] | None) -> str:
@@ -83,7 +83,7 @@ def process_markdown(markdown: str) -> ReadmeDocument:
         clean_text=clean_text,
         extracted_paragraphs=paragraphs[:80],
         readme_length=len(raw),
-        readme_markdown="",
+        readme_md="",
     )
 
 

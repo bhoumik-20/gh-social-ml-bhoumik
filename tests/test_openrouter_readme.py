@@ -4,20 +4,20 @@ import pytest
 import requests
 
 from utils.readme_processor import ReadmeDocument, process_markdown
-from utils.groq_client import generate_readme_markdown
+from utils.openrouter_client import generate_readme_md
 from acquisition.repository_enricher import EnrichmentResult, RepositoryEnricher
 from database.connector import PostgreSQLConnector
 
 
 @pytest.mark.unit
-class TestGroqReadmeMarkdown:
-    """Unit tests for Groq README Markdown generation."""
+class TestOpenRouterReadmeMarkdown:
+    """Unit tests for OpenRouter README Markdown generation."""
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key", "GROQ_MODEL_ID": "llama-3.3-70b-versatile"})
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key", "OPENROUTER_MODEL_ID": "meta-llama/llama-3.3-70b-instruct"})
     @patch("requests.post")
-    def test_generate_readme_markdown_success(self, mock_post):
-        """Test successful markdown generation using the Groq client."""
-        # Setup mock response from Groq API
+    def test_generate_readme_md_success(self, mock_post):
+        """Test successful markdown generation using the OpenRouter client."""
+        # Setup mock response from OpenRouter API
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -32,25 +32,25 @@ class TestGroqReadmeMarkdown:
         mock_post.return_value = mock_response
 
         clean_text = "Cool Project. This is a cool project."
-        result = generate_readme_markdown(clean_text)
+        result = generate_readme_md(clean_text)
 
         # Assertions
         assert result == "# Cool Project\nThis is a cool project."
         mock_post.assert_called_once()
         called_url = mock_post.call_args[0][0]
-        assert "api.groq.com/openai/v1/chat/completions" in called_url
+        assert "openrouter.ai/api/v1/chat/completions" in called_url
         
         called_headers = mock_post.call_args[1]["headers"]
         assert called_headers["Authorization"] == "Bearer test_key"
         
         called_payload = mock_post.call_args[1]["json"]
-        assert called_payload["model"] == "llama-3.3-70b-versatile"
+        assert called_payload["model"] == "meta-llama/llama-3.3-70b-instruct"
         assert clean_text in called_payload["messages"][0]["content"]
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key"})
     @patch("requests.post")
-    def test_generate_readme_markdown_strips_code_fences(self, mock_post):
-        """Test that the Groq client cleans up markdown block wrappers from the model output."""
+    def test_generate_readme_md_strips_code_fences(self, mock_post):
+        """Test that the OpenRouter client cleans up markdown block wrappers from the model output."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -64,44 +64,44 @@ class TestGroqReadmeMarkdown:
         }
         mock_post.return_value = mock_response
 
-        result = generate_readme_markdown("Clean text")
+        result = generate_readme_md("Clean text")
         assert result == "# Project Title\n\n- Bullet list"
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_generate_readme_markdown_missing_key(self):
+    def test_generate_readme_md_missing_key(self):
         """Test that generation fails gracefully (returns empty string) if no API key is configured."""
         # Ensure no keys exist in environ
         with patch.dict(os.environ, {}, clear=True):
-            result = generate_readme_markdown("Clean text")
+            result = generate_readme_md("Clean text")
             assert result == ""
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key"})
     @patch("requests.post")
-    def test_generate_readme_markdown_timeout_graceful(self, mock_post):
+    def test_generate_readme_md_timeout_graceful(self, mock_post):
         """Test that HTTP timeouts are handled gracefully without raising exceptions."""
         mock_post.side_effect = requests.exceptions.Timeout("Connection timed out")
         
-        result = generate_readme_markdown("Clean text")
+        result = generate_readme_md("Clean text")
         assert result == ""
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key"})
     @patch("requests.post")
-    def test_generate_readme_markdown_http_error_graceful(self, mock_post):
+    def test_generate_readme_md_http_error_graceful(self, mock_post):
         """Test that HTTP errors (e.g. 500) are handled gracefully."""
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_response.text = "Internal Server Error"
         mock_post.return_value = mock_response
         
-        result = generate_readme_markdown("Clean text")
+        result = generate_readme_md("Clean text")
         assert result == ""
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
-    @patch("utils.groq_client.rate_limiter")
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key"})
+    @patch("utils.openrouter_client.rate_limiter")
     @patch("time.sleep")
     @patch("requests.post")
-    def test_generate_readme_markdown_retry_on_429_success(self, mock_post, mock_sleep, mock_limiter):
-        """Test that the Groq client retries on HTTP 429 and eventually succeeds."""
+    def test_generate_readme_md_retry_on_429_success(self, mock_post, mock_sleep, mock_limiter):
+        """Test that the OpenRouter client retries on HTTP 429 and eventually succeeds."""
         mock_response_429 = MagicMock()
         mock_response_429.status_code = 429
         
@@ -113,23 +113,23 @@ class TestGroqReadmeMarkdown:
         
         mock_post.side_effect = [mock_response_429, mock_response_200]
         
-        result = generate_readme_markdown("Clean text")
+        result = generate_readme_md("Clean text")
         
         assert result == "# Success"
         assert mock_post.call_count == 2
         mock_sleep.assert_called_with(2.0)
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "test_key"})
-    @patch("utils.groq_client.rate_limiter")
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test_key"})
+    @patch("utils.openrouter_client.rate_limiter")
     @patch("time.sleep")
     @patch("requests.post")
-    def test_generate_readme_markdown_retry_on_429_exhausted(self, mock_post, mock_sleep, mock_limiter):
-        """Test that the Groq client exhausts retries on HTTP 429 and returns empty string."""
+    def test_generate_readme_md_retry_on_429_exhausted(self, mock_post, mock_sleep, mock_limiter):
+        """Test that the OpenRouter client exhausts retries on HTTP 429 and returns empty string."""
         mock_response_429 = MagicMock()
         mock_response_429.status_code = 429
         mock_post.return_value = mock_response_429
         
-        result = generate_readme_markdown("Clean text")
+        result = generate_readme_md("Clean text")
         
         assert result == ""
         assert mock_post.call_count == 4
@@ -138,9 +138,9 @@ class TestGroqReadmeMarkdown:
     @patch("time.sleep")
     @patch("time.time")
     def test_rate_limiter_spacing(self, mock_time, mock_sleep):
-        """Test that the GroqRateLimiter spaces out consecutive requests properly."""
-        from utils.groq_client import GroqRateLimiter
-        limiter = GroqRateLimiter(rpm_limit=15.0)  # 4s spacing
+        """Test that the OpenRouterRateLimiter spaces out consecutive requests properly."""
+        from utils.openrouter_client import OpenRouterRateLimiter
+        limiter = OpenRouterRateLimiter(rpm_limit=15.0)  # 4s spacing
         
         mock_time.return_value = 100.0
         limiter.wait_if_needed()
@@ -153,7 +153,7 @@ class TestGroqReadmeMarkdown:
 
 @pytest.mark.unit
 class TestReadmeDocumentExtension:
-    """Test that ReadmeDocument supports the new readme_markdown field."""
+    """Test that ReadmeDocument supports the new readme_md field."""
 
     def test_readme_document_fields(self):
         doc = ReadmeDocument(
@@ -161,20 +161,20 @@ class TestReadmeDocumentExtension:
             clean_text="Clean",
             extracted_paragraphs=["Clean"],
             readme_length=5,
-            readme_markdown="# Formatted"
+            readme_md="# Formatted"
         )
-        assert doc.readme_markdown == "# Formatted"
+        assert doc.readme_md == "# Formatted"
         
     def test_process_markdown_defaults_empty(self):
         doc = process_markdown("# Raw markdown title\n\nSome paragraph content that is long enough.")
-        assert doc.readme_markdown == ""
+        assert doc.readme_md == ""
 
 
 @pytest.mark.unit
 class TestEnricherIntegration:
-    """Test that RepositoryEnricher populates the readme_markdown field."""
+    """Test that RepositoryEnricher populates the readme_md field."""
 
-    @patch("acquisition.repository_enricher.generate_readme_markdown")
+    @patch("acquisition.repository_enricher.generate_readme_md")
     def test_enricher_batch_populates_markdown(self, mock_generate):
         mock_generate.return_value = "# Processed Markdown"
 
@@ -198,22 +198,22 @@ class TestEnricherIntegration:
 
         assert len(results) == 1
         res = results[0]
-        assert res.readme.readme_markdown == "# Processed Markdown"
-        assert res.payload["readme_markdown"] == "# Processed Markdown"
+        assert res.readme.readme_md == "# Processed Markdown"
+        assert res.payload["readme_md"] == "# Processed Markdown"
         mock_generate.assert_called_once()
 
 
 @pytest.mark.unit
 class TestDatabaseConnectorSchema:
-    """Test database schema updates for readme_markdown."""
+    """Test database schema updates for readme_md."""
 
-    def test_migration_columns_contains_readme_markdown(self):
+    def test_migration_columns_contains_readme_md(self):
         db = PostgreSQLConnector()
         col_names = [col[0] for col in getattr(db, "_migration_columns", [])]
-        assert "readme_markdown" in col_names
+        assert "readme_md" in col_names
 
     @patch("database.connector.PostgreSQLConnector.connect")
-    def test_upsert_includes_readme_markdown(self, mock_connect):
+    def test_upsert_includes_readme_md(self, mock_connect):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_connect.return_value = mock_conn
@@ -228,7 +228,7 @@ class TestDatabaseConnectorSchema:
             clean_text="clean",
             extracted_paragraphs=[],
             readme_length=5,
-            readme_markdown="# Markdown Content"
+            readme_md="# Markdown Content"
         )
         mock_result = MagicMock()
         mock_result.repo_id = "test/repo"
@@ -250,9 +250,9 @@ class TestDatabaseConnectorSchema:
         ]
         assert len(insert_calls) == 1
         
-        # Verify that readme_markdown is in the query columns
+        # Verify that readme_md is in the query columns
         query_str = insert_calls[0][0][0]
-        assert "readme_markdown" in query_str
+        assert "readme_md" in query_str
         
         # Verify that # Markdown Content is in the parameters passed
         params = insert_calls[0][0][1]

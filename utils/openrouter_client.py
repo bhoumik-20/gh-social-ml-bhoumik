@@ -7,8 +7,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-class GroqRateLimiter:
-    """Thread-safe rate limiter to prevent exceeding the Groq API requests-per-minute (RPM) quota."""
+class OpenRouterRateLimiter:
+    """Thread-safe rate limiter to prevent exceeding the OpenRouter API requests-per-minute (RPM) quota."""
     def __init__(self, rpm_limit: float = 100.0):
         self.rpm_limit = rpm_limit
         self.lock = threading.Lock()
@@ -29,27 +29,27 @@ class GroqRateLimiter:
             self.last_request_time = time.time()
 
 
-# Instantiate a global rate limiter. Default to 100 RPM for paid Groq accounts
-_RPM_LIMIT = float(os.getenv("GROQ_RPM_LIMIT", "100"))
-rate_limiter = GroqRateLimiter(rpm_limit=_RPM_LIMIT)
+# Instantiate a global rate limiter. Default to 100 RPM
+_RPM_LIMIT = float(os.getenv("OPENROUTER_RPM_LIMIT", "100"))
+rate_limiter = OpenRouterRateLimiter(rpm_limit=_RPM_LIMIT)
 
 
-def generate_readme_markdown(clean_text: str) -> str:
+def generate_readme_md(clean_text: str) -> str:
     """
     Generate a clean, structured Markdown document from the cleaned README plain text
-    using the Groq Llama-3.3-70b model. Enforces rate limits and automatically retries with 
+    using the OpenRouter API. Enforces rate limits and automatically retries with 
     exponential backoff on HTTP 429.
     """
     if not clean_text or not clean_text.strip():
         return ""
 
-    api_key = os.getenv("GROQ_API_KEY")
-    model = os.getenv("GROQ_MODEL_ID") or "llama-3.3-70b-versatile"
-    url = os.getenv("GROQ_API_URL") or "https://api.groq.com/openai/v1/chat/completions"
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    model = os.getenv("OPENROUTER_MODEL_ID") or "meta-llama/llama-3.3-70b-instruct"
+    url = os.getenv("OPENROUTER_API_URL") or "https://openrouter.ai/api/v1/chat/completions"
 
     if not api_key:
         logger.warning(
-            "No GROQ_API_KEY found in the environment. "
+            "No OPENROUTER_API_KEY found in the environment. "
             "Skipping README markdown generation."
         )
         return ""
@@ -57,6 +57,8 @@ def generate_readme_markdown(clean_text: str) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("CLIENT_URL") or "http://localhost:8081", # Optional, for including your app on openrouter.ai rankings.
+        "X-Title": "GH Social ML", # Optional. Shows in rankings on openrouter.ai.
     }
     
     prompt = (
@@ -90,7 +92,7 @@ def generate_readme_markdown(clean_text: str) -> str:
         rate_limiter.wait_if_needed()
 
         try:
-            logger.info(f"Generating README markdown using Groq model '{model}' (Attempt {attempt + 1}/{max_retries + 1})...")
+            logger.info(f"Generating README markdown using OpenRouter model '{model}' (Attempt {attempt + 1}/{max_retries + 1})...")
             # Set a 45-second timeout to accommodate model reasoning/latency
             response = requests.post(url, json=payload, headers=headers, timeout=45)
             
@@ -105,30 +107,30 @@ def generate_readme_markdown(clean_text: str) -> str:
                             text_out = text_out[:-3].strip()
                     return text_out.strip()
                 except (KeyError, IndexError) as e:
-                    logger.error(f"Failed to parse Groq API response payload: {e}")
+                    logger.error(f"Failed to parse OpenRouter API response payload: {e}")
                     return ""
             
             elif response.status_code == 429:
                 if attempt < max_retries:
                     sleep_time = backoff_factor ** attempt * 2.0
-                    logger.warning(f"Groq API rate limit exceeded (HTTP 429). Retrying in {sleep_time}s...")
+                    logger.warning(f"OpenRouter API rate limit exceeded (HTTP 429). Retrying in {sleep_time}s...")
                     time.sleep(sleep_time)
                     continue
                 else:
-                    logger.error("Groq API rate limit exceeded (HTTP 429) and max retries exhausted.")
+                    logger.error("OpenRouter API rate limit exceeded (HTTP 429) and max retries exhausted.")
                     return ""
             
             else:
-                logger.error(f"Groq API returned error status {response.status_code}: {response.text}")
+                logger.error(f"OpenRouter API returned error status {response.status_code}: {response.text}")
                 return ""
                 
         except Exception as exc:
             if attempt < max_retries:
-                logger.warning(f"Error calling Groq API: {exc}. Retrying...")
+                logger.warning(f"Error calling OpenRouter API: {exc}. Retrying...")
                 time.sleep(1.0)
                 continue
             else:
-                logger.error(f"Error calling Groq API after max retries: {exc}")
+                logger.error(f"Error calling OpenRouter API after max retries: {exc}")
                 return ""
     
     return ""

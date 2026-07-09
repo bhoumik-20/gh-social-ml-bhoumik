@@ -44,10 +44,11 @@ class PostgreSQLConnector:
         ("full_name", "VARCHAR(255)"),
         ("description", "TEXT"),
         ("primary_language", "VARCHAR(50)"),
+        ("special_label", "VARCHAR(50)"),
         ("language_used", "JSONB DEFAULT '[]'::jsonb"),
         ("topics", "JSONB DEFAULT '[]'::jsonb"),
         ("readme_summary", "TEXT"),
-        ("readme_markdown", "TEXT"),
+        ("readme_md", "TEXT"),
         ("star_count", "INT DEFAULT 0"),
         ("forks_count", "INT DEFAULT 0"),
         ("pr_count", "INT DEFAULT 0"),
@@ -238,10 +239,11 @@ class PostgreSQLConnector:
                 full_name VARCHAR(255) NOT NULL,
                 description TEXT,
                 primary_language VARCHAR(50),
+                special_label VARCHAR(50),
                 language_used JSONB DEFAULT '[]'::jsonb,
                 topics JSONB DEFAULT '[]'::jsonb,
                 readme_summary TEXT,
-                readme_markdown TEXT,
+                readme_md TEXT,
                 star_count INT DEFAULT 0,
                 likes_count INT DEFAULT 0,
                 comments_count INT DEFAULT 0,
@@ -274,10 +276,11 @@ class PostgreSQLConnector:
                     full_name VARCHAR(255) NOT NULL,
                     description TEXT,
                     primary_language VARCHAR(50),
+                    special_label VARCHAR(50),
                     language_used JSONB DEFAULT '[]'::jsonb,
                     topics JSONB DEFAULT '[]'::jsonb,
                     readme_summary TEXT,
-                    readme_markdown TEXT,
+                    readme_md TEXT,
                     star_count INT DEFAULT 0,
                     likes_count INT DEFAULT 0,
                     comments_count INT DEFAULT 0,
@@ -345,10 +348,10 @@ class PostgreSQLConnector:
             upsert_query = """
             INSERT INTO Repo (
                 repo_id, github_repo_url, owner_id, repo_name, full_name, description,
-                primary_language, language_used, topics, readme_summary,
-                readme_markdown, star_count, forks_count, pr_count
+                primary_language, special_label, language_used, topics, readme_summary,
+                readme_md, star_count, forks_count, pr_count
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 CAST(%s AS jsonb), CAST(%s AS jsonb),
                 %s, %s, %s, %s, %s
             )
@@ -358,10 +361,11 @@ class PostgreSQLConnector:
                 full_name = EXCLUDED.full_name,
                 description = EXCLUDED.description,
                 primary_language = EXCLUDED.primary_language,
+                special_label = EXCLUDED.special_label,
                 language_used = EXCLUDED.language_used,
                 topics = EXCLUDED.topics,
                 readme_summary = EXCLUDED.readme_summary,
-                readme_markdown = EXCLUDED.readme_markdown,
+                readme_md = EXCLUDED.readme_md,
                 star_count = EXCLUDED.star_count,
                 forks_count = EXCLUDED.forks_count,
                 pr_count = EXCLUDED.pr_count,
@@ -380,6 +384,7 @@ class PostgreSQLConnector:
                 description = (p.get("description") or "")[:2000]  # cap for safety
 
                 primary_language = p.get("primary_language") or raw.get("language") or "Unknown"
+                special_label = p.get("special_label")
 
                 # Languages as JSONB — store full {lang: bytes} mapping
                 languages_json = json.dumps(r.languages or {})
@@ -389,7 +394,7 @@ class PostgreSQLConnector:
                 readme_text = getattr(r.readme, "clean_text", "") or ""
                 readme_summary = readme_text[:5000]
 
-                readme_markdown = getattr(r.readme, "readme_markdown", "") or ""
+                readme_md = getattr(r.readme, "readme_md", "") or ""
 
                 star_count = int(p.get("star_count") or 0)
                 forks_count = int(p.get("fork_count") or 0)
@@ -407,10 +412,11 @@ class PostgreSQLConnector:
                     full_name,
                     description,
                     primary_language,
+                    special_label,
                     languages_json,
                     topics_json,
                     readme_summary,
-                    readme_markdown,
+                    readme_md,
                     star_count,
                     forks_count,
                     pr_count,

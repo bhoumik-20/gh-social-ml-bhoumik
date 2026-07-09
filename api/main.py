@@ -6,6 +6,14 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# Force PyTorch and underlying math libraries to use a single thread to save RAM during deployment
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["MALLOC_ARENA_MAX"] = "2"
+
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.concurrency import run_in_threadpool

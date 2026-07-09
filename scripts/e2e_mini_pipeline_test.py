@@ -2,16 +2,16 @@
 """
 scripts/e2e_mini_pipeline_test.py
 ==================================
-End-to-end mini pipeline test for 5 repositories.
+End-to-end mini pipeline test for repositories.
 
 Flow:
   1. Live-fetch 5 repos from GitHub
   2. Quality filter (README, description, language checks)
-  3. Gemma README Markdown enrichment (generates readme_markdown)
+  3. Gemma README Markdown enrichment (generates readme_md)
   4. Upsert into Supabase (PostgreSQL)
   5. Embed + index into Qdrant
   6. Run retrieval engine for one user (medhansh_generalist)
-  7. Pull FULL metadata (including readme_markdown) from DB for ranked repos
+  7. Pull FULL metadata (including readme_md) from DB for ranked repos
   8. Display rich output
 
 Usage:
@@ -50,7 +50,7 @@ for noisy in ("httpx", "urllib3", "sentence_transformers", "pipeline.retrieval")
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-NUM_REPOS   = 5
+NUM_REPOS   = 200
 TARGET_USER = "medhansh_generalist"
 
 DIVIDER     = "═" * 90
@@ -62,7 +62,7 @@ SUBDIV      = "─" * 90
 # ──────────────────────────────────────────────────────────────────────────── #
 def step_acquire(token: str) -> list:
     print(f"\n{DIVIDER}")
-    print("  STEP 1 — Live GitHub Acquisition (fetching 5 repositories)")
+    print(f"  STEP 1 — Live GitHub Acquisition (fetching {NUM_REPOS} repositories)")
     print(DIVIDER)
 
     from acquisition.pipeline import run_acquisition
@@ -70,8 +70,8 @@ def step_acquire(token: str) -> list:
     enriched = run_acquisition(
         token,
         limit=NUM_REPOS,
-        batch_size=NUM_REPOS,
-        workers=2,
+        batch_size=10,
+        workers=20,
         existing_repos=set(),   # no deduplication — fresh fetch
     )
     logger.info("Acquired %d repositories from GitHub.", len(enriched))
@@ -101,21 +101,21 @@ def step_quality_filter(enriched: list) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-# STEP 3 — Gemma README Markdown enrichment
+# STEP 3 — OpenRouter README Markdown enrichment
 # ──────────────────────────────────────────────────────────────────────────── #
-def step_gemma_enrichment(kept: list) -> list:
+def step_openrouter_enrichment(kept: list) -> list:
     print(f"\n{DIVIDER}")
-    print("  STEP 3 — Gemma README Markdown Enrichment")
+    print("  STEP 3 — OpenRouter README Markdown Enrichment")
     print(DIVIDER)
 
-    from utils.groq_client import generate_readme_markdown
+    from utils.openrouter_client import generate_readme_md
     from utils.readme_processor import process_markdown
 
     for r in kept:
         p = r.payload
         raw_readme = p.get("readme", "") or p.get("readme_summary", "") or p.get("description", "")
         if not raw_readme:
-            logger.warning("No README content for %s — skipping Groq enrichment.", r.repo_id)
+            logger.warning("No README content for %s — skipping OpenRouter enrichment.", r.repo_id)
             continue
 
         # Clean raw text first
@@ -125,15 +125,15 @@ def step_gemma_enrichment(kept: list) -> list:
             logger.warning("ReadmeProcessor returned empty clean_text for %s.", r.repo_id)
             continue
 
-        # Generate structured Markdown via Groq API
-        md = generate_readme_markdown(clean_text[:3000])   # cap to avoid huge token usage
+        # Generate structured Markdown via OpenRouter API
+        md = generate_readme_md(clean_text[:3000])   # cap to avoid huge token usage
         if md:
-            p["readme_markdown"] = md
-            readme_doc.readme_markdown = md
+            p["readme_md"] = md
+            readme_doc.readme_md = md
             r.readme = readme_doc
-            logger.info("✅ Groq generated Markdown for %s (%d chars).", r.repo_id, len(md))
+            logger.info("✅ OpenRouter generated Markdown for %s (%d chars).", r.repo_id, len(md))
         else:
-            logger.warning("Groq returned empty result for %s.", r.repo_id)
+            logger.warning("OpenRouter returned empty result for %s.", r.repo_id)
 
     return kept
 
@@ -163,12 +163,15 @@ def step_embed_qdrant(kept: list) -> bool:
     import urllib.request
     import urllib.error
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
     try:
-        urllib.request.urlopen(f"{qdrant_url}/healthz", timeout=3)
-    except Exception:
-        print(f"  ⚠️  Qdrant is not reachable at {qdrant_url}.")
+        req = urllib.request.Request(f"{qdrant_url}/healthz")
+        if qdrant_api_key:
+            req.add_header("api-key", qdrant_api_key)
+        urllib.request.urlopen(req, timeout=3)
+    except Exception as e:
+        print(f"  ⚠️  Qdrant is not reachable at {qdrant_url}. Error: {e}")
         print("  ℹ️  Skipping Qdrant embedding. Retrieval will use DB-direct fallback.")
-        print("  ➡️  To start Qdrant locally: docker run -p 6333:6333 qdrant/qdrant")
         return False
 
     from main import index_approved_repositories
@@ -262,8 +265,8 @@ def fetch_full_metadata(repo_ids: list[str], db) -> dict[str, dict]:
                         description, primary_language, language_used,
                         topics, star_count, forks_count, pr_count,
                         likes_count, comments_count, saves_count, views_count,
-                        readme_summary, readme_markdown,
-                        github_repo_url, created_at, updated_at
+                        readme_summary, readme_md,
+                        github_repo_url, created_at, updated_at, special_label
                     FROM Repo
                     WHERE full_name = %s OR CAST(repo_id AS TEXT) = %s
                     LIMIT 1;
@@ -289,10 +292,11 @@ def fetch_full_metadata(repo_ids: list[str], db) -> dict[str, dict]:
                         "saves_count":      row[13] or 0,
                         "views_count":      row[14] or 0,
                         "readme_summary":   row[15] or "",
-                        "readme_markdown":  row[16] or "",
+                        "readme_md":  row[16] or "",
                         "github_repo_url":  row[17] or "",
                         "created_at":       str(row[18]),
                         "updated_at":       str(row[19]),
+                        "special_label":    row[20] or "",
                     }
             except Exception as e:
                 logger.warning("Could not fetch metadata for '%s': %s", rid, e)
@@ -370,9 +374,14 @@ def display_results(batches: dict, db) -> None:
                         topics = []
                 topics_str = ", ".join(topics[:5]) if isinstance(topics, list) else str(topics)
 
+                topics_str = ", ".join(topics[:5]) if isinstance(topics, list) else str(topics)
+                spec_lbl = meta.get("special_label")
+
                 print(f"  📄  Description    : {desc}")
                 print(f"  🔗  GitHub URL     : {meta['github_repo_url']}")
                 print(f"  💻  Language       : {lang}")
+                if lang == "Unknown" and spec_lbl:
+                    print(f"  🏷️   Special Label  : {spec_lbl} (Inferred from repo context)")
                 print(f"  🌐  All Languages  : {langs_str or '—'}")
                 print(f"  🏷️   Topics         : {topics_str or '—'}")
                 print(f"  ⭐  Stars          : {stars}")
@@ -386,9 +395,9 @@ def display_results(batches: dict, db) -> None:
                 print(f"  🔄  Updated At     : {meta['updated_at']}")
 
                 # README Markdown section
-                readme_md = meta.get("readme_markdown", "").strip()
+                readme_md = meta.get("readme_md", "").strip()
                 if readme_md:
-                    print(f"\n  📝  README (Groq Formatted Markdown):")
+                    print(f"\n  📝  README (OpenRouter Formatted Markdown):")
                     print(f"  {'·' * 60}")
                     # Print the first 25 lines of the Markdown for readability
                     md_lines = readme_md.splitlines()
@@ -398,7 +407,7 @@ def display_results(batches: dict, db) -> None:
                         print(f"      ... [{len(md_lines) - 25} more lines]")
                     print(f"  {'·' * 60}")
                 else:
-                    print(f"\n  📝  README (Groq Formatted Markdown): ⚠️  Not generated yet")
+                    print(f"\n  📝  README (OpenRouter Formatted Markdown): ⚠️  Not generated yet")
                     summary = meta.get("readme_summary", "").strip()
                     if summary:
                         print(f"  Raw README Summary: {summary[:300]}")
@@ -429,13 +438,13 @@ def main():
         logger.warning("DB not connected — metadata display will be limited.")
 
     print("\n" + DIVIDER)
-    print("   gh-social-ml · END-TO-END MINI PIPELINE TEST (5 repos)")
+    print(f"   gh-social-ml · END-TO-END MINI PIPELINE TEST ({NUM_REPOS} repos)")
     print(DIVIDER)
 
     # Run all steps
     enriched   = step_acquire(token)
     kept       = step_quality_filter(enriched)
-    kept       = step_gemma_enrichment(kept)
+    kept       = step_openrouter_enrichment(kept)
     step_upsert_db(kept, db)
     qdrant_ok  = step_embed_qdrant(kept)
     batches    = step_retrieve(kept, db, qdrant_ok=qdrant_ok)
