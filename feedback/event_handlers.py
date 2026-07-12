@@ -221,7 +221,24 @@ class FeedbackHandler:
                         # Best-effort Qdrant rollback since Postgres commit failed
                         if state_changed and resolved_alpha != 0.0:
                             logger.error("Postgres commit failed, attempting to rollback Qdrant vector shift...")
-                            self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            if not rollback_success:
+                                logger.critical(
+                                    "CRITICAL: Failed to rollback Qdrant for user '%s'. Vector drift occurred.",
+                                    user_id
+                                )
+                                if self.redis_client:
+                                    try:
+                                        import json
+                                        dlq_payload = json.dumps({
+                                            "user_id": user_id,
+                                            "repo_id": repo_id,
+                                            "compensating_alpha": -resolved_alpha,
+                                            "error": str(exc)
+                                        })
+                                        self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
+                                    except Exception as dlq_exc:
+                                        logger.error("Failed to write to DLQ: %s", dlq_exc)
                         raise exc
                 else:
                     conn.rollback()
