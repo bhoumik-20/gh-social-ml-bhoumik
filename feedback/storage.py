@@ -154,10 +154,16 @@ class FeedbackStore:
     def scores_for_user(self, user_id: str) -> dict[str, float]:
         scores: dict[str, float] = {}
         for record in self.list_for_user(user_id):
-            scores[record.repo_id] = max(
-                -1.0,
-                min(1.0, scores.get(record.repo_id, 0.0) + record.feedback_score),
-            )
+            if record.interaction_type == "dislike":
+                scores[record.repo_id] = -1.0
+            elif scores.get(record.repo_id, 0.0) == -1.0:
+                # Explicit dislike overrides any positive feedback sum
+                continue
+            else:
+                scores[record.repo_id] = max(
+                    -1.0,
+                    min(1.0, scores.get(record.repo_id, 0.0) + record.feedback_score),
+                )
         return scores
 
 
