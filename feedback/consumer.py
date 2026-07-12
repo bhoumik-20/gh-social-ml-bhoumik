@@ -70,9 +70,10 @@ class FeedbackConsumer:
                     continue
 
                 # Process feedback in a background thread to prevent blocking the asyncio event loop
+                success = False
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
+                    success = await loop.run_in_executor(
                         None,
                         lambda: self.handler.handle_feedback(
                             user_id, repo_id, action, dwell_seconds=dwell_seconds
@@ -80,8 +81,13 @@ class FeedbackConsumer:
                     )
                 except Exception as exc:
                     logger.error("Exception occurred while handling feedback: %s", exc)
-                finally:
-                    queue.task_done()
+                
+                if not success:
+                    # Retry in-memory events if they fail processing by placing them back
+                    logger.warning("Local queue event failed. Re-queueing.")
+                    await queue.put(event)
+                
+                queue.task_done()
 
             except asyncio.CancelledError:
                 break

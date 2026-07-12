@@ -201,29 +201,48 @@ class FeedbackHandler:
                 if not cache_success:
                     logger.warning("Failed to invalidate feed cache for user '%s'", user_id)
 
+            # 3. Update Qdrant user embedding vector using the resolved alpha
+            # We do this BEFORE Postgres commit so we can compute the correct resolved_alpha.
+            qdrant_success = True
+            if state_changed and resolved_alpha != 0.0:
+                if cache_success:
+                    qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
+                    if not qdrant_success:
+                        logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
+                else:
+                    qdrant_success = False
+
             if conn:
-                if db_success and cache_success:
+                if db_success and qdrant_success and cache_success:
                     try:
                         conn.commit()
                     except Exception as exc:
                         conn.rollback()
+                        # Postgres failed. We MUST rollback Qdrant to safely retry.
+                        if state_changed and resolved_alpha != 0.0:
+                            logger.error("Postgres commit failed, attempting to rollback Qdrant vector shift...")
+                            rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            if not rollback_success:
+                                logger.critical("CRITICAL: Failed to rollback Qdrant for user '%s'.", user_id)
+                                if self.redis_client:
+                                    try:
+                                        import json
+                                        dlq_payload = json.dumps({
+                                            "user_id": user_id,
+                                            "repo_id": repo_id,
+                                            "compensating_alpha": -resolved_alpha,
+                                            "error": str(exc)
+                                        })
+                                        self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
+                                    except Exception:
+                                        pass
+                                # If rollback fails, we CANNOT retry, otherwise we double-shift Qdrant.
+                                # Acknowledge the event by returning True. The DB row is lost, but ML vector is intact.
+                                return True
                         raise exc
                 else:
                     conn.rollback()
-                    return False
 
-            # 3. Update Qdrant user embedding vector using the resolved alpha
-            # We do this AFTER Postgres is successfully committed to prevent
-            # double vector application if Postgres commit fails.
-            qdrant_success = True
-            if state_changed and resolved_alpha != 0.0:
-                qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
-                if not qdrant_success:
-                    logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
-
-            # If Qdrant fails, we return False to retry. On retry, state_changed will be False,
-            # so the event will safely ack without double-applying Qdrant. The vector shift is lost,
-            # but this prevents fatal data corruption.
             return db_success and qdrant_success and cache_success
         except Exception:
             if conn:
