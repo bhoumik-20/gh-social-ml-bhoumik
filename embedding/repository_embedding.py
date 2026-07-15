@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from numbers import Integral, Real
 from typing import Any
 
 def _parse_list_field(val: Any) -> list[str]:
@@ -17,7 +20,7 @@ def _parse_list_field(val: Any) -> list[str]:
         except Exception:
             return []
     if isinstance(val, dict):
-        return list(val.keys())
+        return [str(x) for x in val if x]
     if isinstance(val, list):
         return [str(x) for x in val if x]
     return []
@@ -31,6 +34,11 @@ from config import (
     REPOSITORY_EMBEDDING_VERSION,
 )
 from .embeddings import Vector, aggregate_vectors
+from .vector_contract import (
+    resolve_repository_identity,
+    validate_embedding_vector,
+    validate_repository_payload,
+)
 from ingestion.features import (
     activity_score,
     extract_tags,
@@ -59,6 +67,8 @@ class RepositoryEmbeddingConfig:
     tower_weights: dict[str, float] = field(default_factory=lambda: dict(REPO_TOWER_WEIGHTS))
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("model_name must be a non-empty string")
         expected_dim = SUPPORTED_REPOSITORY_EMBEDDING_DIMS.get(self.model_name)
         if expected_dim is None:
             supported = ", ".join(sorted(SUPPORTED_REPOSITORY_EMBEDDING_DIMS))
@@ -67,11 +77,48 @@ class RepositoryEmbeddingConfig:
                 "The current Qdrant schema requires a known repository embedding dimension. "
                 f"Supported models: {supported}."
             )
-        if int(self.embedding_dim) != expected_dim:
+        if isinstance(self.embedding_dim, bool) or not isinstance(self.embedding_dim, Integral):
+            raise TypeError("embedding_dim must be an integer")
+        if self.embedding_dim != expected_dim:
             raise ValueError(
                 f"Repository embedding model {self.model_name!r} produces {expected_dim} dimensions, "
                 f"but embedding_dim is configured as {self.embedding_dim}."
             )
+        if not isinstance(self.version, str) or not self.version.strip():
+            raise ValueError("version must be a non-empty string")
+        if (
+            isinstance(self.readme_chunk_chars, bool)
+            or not isinstance(self.readme_chunk_chars, Integral)
+            or self.readme_chunk_chars <= 0
+        ):
+            raise ValueError("readme_chunk_chars must be a positive integer")
+        if (
+            isinstance(self.readme_chunk_overlap_chars, bool)
+            or not isinstance(self.readme_chunk_overlap_chars, Integral)
+            or self.readme_chunk_overlap_chars < 0
+        ):
+            raise ValueError("readme_chunk_overlap_chars must be a non-negative integer")
+        if self.readme_chunk_overlap_chars >= self.readme_chunk_chars:
+            raise ValueError("readme_chunk_overlap_chars must be smaller than readme_chunk_chars")
+
+        expected_towers = {"readme", "metadata", "topics"}
+        if not isinstance(self.tower_weights, Mapping):
+            raise TypeError("tower_weights must be a mapping")
+        if set(self.tower_weights) != expected_towers:
+            raise ValueError(
+                "tower_weights must contain exactly: metadata, readme, topics"
+            )
+        validated_weights: dict[str, float] = {}
+        for tower, raw_weight in self.tower_weights.items():
+            if isinstance(raw_weight, bool) or not isinstance(raw_weight, Real):
+                raise TypeError(f"tower weight {tower!r} must be a real number")
+            weight = float(raw_weight)
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(f"tower weight {tower!r} must be finite and non-negative")
+            validated_weights[tower] = weight
+        if sum(validated_weights.values()) <= 0:
+            raise ValueError("tower_weights must have a positive total")
+        self.tower_weights = validated_weights
 
 
 @dataclass(slots=True)
@@ -174,46 +221,218 @@ def build_vector_payload(
     config: RepositoryEmbeddingConfig,
 ) -> dict[str, Any]:
     """Build the Qdrant payload schema for one repository vector."""
+    normalized_repo = dict(repo)
+    normalized_repo["repo_id"] = repo_id
+    canonical_repo_id, full_name = resolve_repository_identity(normalized_repo)
+    validated_embedding = validate_embedding_vector(
+        final_embedding,
+        expected_size=config.embedding_dim,
+        field_name=f"embedding for {canonical_repo_id}",
+    )
+    normalized_repo.update(
+        {
+            "repo_id": canonical_repo_id,
+            "full_name": full_name,
+            "github_id": _optional_decimal_string_field(repo.get("github_id")),
+            "description": _string_field(repo.get("description"), "description", default=""),
+            "primary_language": _string_field(
+                repo.get("primary_language"), "primary_language", default="Unknown"
+            ),
+            "languages": _parse_list_field(repo.get("languages")),
+            "topics": _parse_list_field(repo.get("topics")),
+            "star_count": _integer_field(repo.get("star_count"), "star_count", default=0),
+            "fork_count": _integer_field(repo.get("fork_count"), "fork_count", default=0),
+            "open_issues_count": _integer_field(
+                repo.get("open_issues_count"), "open_issues_count", default=0
+            ),
+            "readme_length": _integer_field(
+                repo.get("readme_length"), "readme_length", default=0
+            ),
+            "pushed_days_ago": _integer_field(
+                repo.get("pushed_days_ago"), "pushed_days_ago", default=999
+            ),
+            "delta_3d": _integer_field(
+                repo.get("delta_3d"), "delta_3d", default=0, non_negative=False
+            ),
+            "delta_7d": _integer_field(
+                repo.get("delta_7d"), "delta_7d", default=0, non_negative=False
+            ),
+            "delta_30d": _integer_field(
+                repo.get("delta_30d"), "delta_30d", default=0, non_negative=False
+            ),
+            "mentionable_users_count": _integer_field(
+                repo.get("mentionable_users_count"),
+                "mentionable_users_count",
+                default=0,
+            ),
+            "content_version": _integer_field(
+                repo.get("content_version"), "content_version", default=0
+            ),
+            "readme_to_codebase_ratio": _finite_number_field(
+                repo.get("readme_to_codebase_ratio"),
+                "readme_to_codebase_ratio",
+                default=0.0,
+            ),
+            "extracted_paragraphs": _parse_list_field(repo.get("extracted_paragraphs")),
+            "recent_commits": _parse_list_field(repo.get("recent_commits")),
+        }
+    )
+    normalized_readme_chunks = _integer_field(
+        readme_chunks, "readme_chunks", default=0
+    )
     # The below payload fields are for Qdrant filtering and inspection without
     # fetching the original repository object again.
-    tags = extract_tags(repo_id, repo.get("extracted_paragraphs", []))
-    category = classify_category(dict(repo), tags)
-    documentation = score_documentation(dict(repo))
+    tags = extract_tags(full_name, normalized_repo["extracted_paragraphs"])
+    category = classify_category(normalized_repo, tags)
+    documentation = score_documentation(normalized_repo)
 
-    return {
-        "repo_id": repo_id,
-        "full_name": repo.get("full_name"),
-        "html_url": repo.get("html_url"),
-        "description": repo.get("description") or "",
-        "primary_language": repo.get("primary_language") or "Unknown",
-        "languages": _parse_list_field(repo.get("languages")),
-        "topics": _parse_list_field(repo.get("topics")),
-        "star_count": int(repo.get("star_count") or 0),
-        "fork_count": int(repo.get("fork_count") or 0),
-        "open_issues_count": int(repo.get("open_issues_count") or 0),
-        "readme_length": int(repo.get("readme_length") or 0),
-        "readme_chunks": readme_chunks,
-        "pushed_days_ago": int(repo.get("pushed_days_ago") or 999),
-        "delta_3d": int(repo.get("delta_3d") or 0),
-        "delta_7d": int(repo.get("delta_7d") or 0),
-        "delta_30d": int(repo.get("delta_30d") or 0),
-        "mentionable_users_count": int(repo.get("mentionable_users_count") or 0),
-        "created_at": repo.get("created_at"),
-        "updated_at": repo.get("updated_at"),
-        "pushed_at": repo.get("pushed_at"),
-        "discovery_category": repo.get("discovery_category"),
-        "discovery_band": repo.get("discovery_band"),
+    payload = {
+        "repo_id": canonical_repo_id,
+        "github_id": normalized_repo["github_id"],
+        "full_name": full_name,
+        "html_url": _optional_string_field(repo.get("html_url"), "html_url"),
+        "description": normalized_repo["description"],
+        "primary_language": normalized_repo["primary_language"],
+        "languages": normalized_repo["languages"],
+        "topics": normalized_repo["topics"],
+        "star_count": normalized_repo["star_count"],
+        "fork_count": normalized_repo["fork_count"],
+        "open_issues_count": normalized_repo["open_issues_count"],
+        "readme_length": normalized_repo["readme_length"],
+        "readme_chunks": normalized_readme_chunks,
+        "pushed_days_ago": normalized_repo["pushed_days_ago"],
+        "delta_3d": normalized_repo["delta_3d"],
+        "delta_7d": normalized_repo["delta_7d"],
+        "delta_30d": normalized_repo["delta_30d"],
+        "mentionable_users_count": normalized_repo["mentionable_users_count"],
+        "created_at": _timestamp_field(repo.get("created_at"), "created_at"),
+        "updated_at": _timestamp_field(repo.get("updated_at"), "updated_at"),
+        "pushed_at": _timestamp_field(repo.get("pushed_at"), "pushed_at"),
+        "discovery_category": _optional_string_field(
+            repo.get("discovery_category"), "discovery_category"
+        ),
+        "discovery_band": _optional_string_field(
+            repo.get("discovery_band"), "discovery_band"
+        ),
         "category": category,
         "tags": tags,
-        "doc_quality": documentation.score,
-        "code_health": score_code_health(dict(repo)),
-        "activity_score": activity_score(dict(repo)),
-        "trend_velocity": trend_velocity(dict(repo)),
-        "embedding_dim": len(final_embedding),
+        "doc_quality": _finite_number_field(documentation.score, "doc_quality"),
+        "code_health": _finite_number_field(
+            score_code_health(normalized_repo), "code_health"
+        ),
+        "activity_score": _finite_number_field(
+            activity_score(normalized_repo), "activity_score"
+        ),
+        "trend_velocity": _finite_number_field(
+            trend_velocity(normalized_repo), "trend_velocity"
+        ),
+        "embedding_dim": len(validated_embedding),
         "embedding_model": config.model_name,
         "embedding_version": config.version,
-        "source_hash": source_hash,
+        "content_version": normalized_repo["content_version"],
+        "content_hash": _string_field(
+            repo.get("content_hash") or source_hash, "content_hash"
+        ),
+        "model_version": _string_field(
+            repo.get("model_version") or config.model_name, "model_version"
+        ),
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+        "source_hash": _string_field(source_hash, "source_hash"),
     }
+    validate_repository_payload(payload)
+    return payload
+
+
+def _string_field(value: Any, field_name: str, *, default: str | None = None) -> str:
+    if value is None or value == "":
+        if default is not None:
+            return default
+        raise ValueError(f"{field_name} must be a non-empty string")
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized and default is None:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return normalized or default or ""
+
+
+def _optional_string_field(value: Any, field_name: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string or None")
+    return value.strip() or None
+
+
+def _optional_decimal_string_field(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise TypeError("github_id must be a decimal string or None")
+    normalized = value.strip()
+    if not normalized.isdecimal():
+        raise ValueError("github_id must be a decimal string")
+    return normalized
+
+
+def _integer_field(
+    value: Any,
+    field_name: str,
+    *,
+    default: int,
+    non_negative: bool = True,
+) -> int:
+    if value is None or value == "":
+        result = default
+    elif isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    elif isinstance(value, Integral):
+        result = int(value)
+    elif isinstance(value, Real) and math.isfinite(float(value)) and float(value).is_integer():
+        result = int(value)
+    elif isinstance(value, str):
+        try:
+            result = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+    else:
+        raise TypeError(f"{field_name} must be an integer")
+    if non_negative and result < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return result
+
+
+def _finite_number_field(value: Any, field_name: str, *, default: float = 0.0) -> float:
+    if value is None or value == "":
+        result = default
+    elif isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{field_name} must be a real number")
+    else:
+        result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be finite")
+    return result
+
+
+def _timestamp_field(value: Any, field_name: str) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+        normalized = value.isoformat()
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+            raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
+        return normalized
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be an ISO-8601 UTC string or None")
+    normalized = value.strip()
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field_name} must be an ISO-8601 UTC timestamp")
+    return normalized
 
 
 def source_fingerprint(*parts: str) -> str:
