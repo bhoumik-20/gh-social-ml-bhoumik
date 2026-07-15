@@ -2,18 +2,17 @@
 
 This runbook covers the two Person 1 worker processes:
 
-1. repository corpus acquisition, enrichment, Postgres persistence, and Qdrant indexing;
-2. GitHub Trending refresh, Postgres persistence, and Qdrant payload synchronization.
+1. repository corpus acquisition, enrichment, and backend v2 delivery;
+2. enriched GitHub Trending snapshot delivery to backend v2.
 
 Both are offline jobs. Do not invoke either command from an API request handler.
 
 ## Safety contract
 
-- Postgres is the production source of truth for corpus ingestion.
-- A repository is indexed only after its Postgres upsert succeeds.
-- Qdrant-only acquisition requires the explicit development flag.
-- Trending synchronization patches payload fields and never replaces vectors.
-- Trending synchronization starts only after the complete trending batch reaches Postgres.
+- The backend is the production source of truth and creates canonical repository UUIDs.
+- Workers write neither PostgreSQL nor Qdrant directly.
+- Backend repository mappings are validated before a source is counted as delivered.
+- Trending snapshots are complete and atomically activated by the backend.
 - Repository and user embeddings must use the model and dimension published by the embedding owner.
 - Checkpoints contain repository identities and bounded error messages, not tokens or README content.
 
@@ -24,17 +23,15 @@ Copy `.env.example` to `.env` and replace every placeholder used by the worker.
 Required for production corpus acquisition:
 
 - `GITHUB_TOKEN`
-- `DATABASE_URL`
+- `BACKEND_URL`
+- `INTERNAL_API_SECRET`
 - `CORPUS_TARGET_COUNT` (default `50000`)
 - `ACQUISITION_MAX_CYCLES` (default `1`)
 - `ACQUISITION_CHECKPOINT_PATH`
-- `QDRANT_URL`
-- `QDRANT_COLLECTION_NAME`
-- `EMBEDDING_MODEL`
 
 `OPENROUTER_API_KEY` is optional. Without it, README Markdown restructuring is skipped while normal README processing continues.
 
-Trending uses the same `DATABASE_URL` and Qdrant settings. Enable payload synchronization with either `TRENDING_QDRANT_SYNC_ENABLED=true` or the `--sync-qdrant` flag.
+Trending uses the same backend credentials and enriches scraped repositories before publishing a snapshot.
 
 ## Network-free validation
 
@@ -68,9 +65,7 @@ python3 main.py \
 
 The target defaults to `CORPUS_TARGET_COUNT`. `--limit` bounds one discovery cycle; it does not request the full corpus target at once.
 
-For a deliberate Postgres-only pass, use `--no-index-qdrant`. Successfully persisted repository identities are recorded as pending indexing and resume during the next normal run.
-
-`--allow-qdrant-without-postgres` is development-only. Never use it for a production corpus run.
+Embedding and Qdrant indexing are scheduled by the backend outbox after successful repository delivery.
 
 ### Stop and resume
 
@@ -95,13 +90,13 @@ Inspect the final `Corpus run report` log and the checkpoint's `last_run`, `fail
 Run one forced refresh and synchronize existing Qdrant points:
 
 ```bash
-python3 trending_service.py --once --sync-qdrant
+python3 trending_service.py --once
 ```
 
 Run the long-lived scheduler:
 
 ```bash
-python3 trending_service.py --scheduled --sync-qdrant
+python3 trending_service.py --scheduled
 ```
 
 The scheduler handles `SIGINT` and `SIGTERM`. A normal stop clears its in-process schedule and exits the loop.

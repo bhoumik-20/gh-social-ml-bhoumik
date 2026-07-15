@@ -1,8 +1,8 @@
 """Command-line entry point for the production repository corpus pipeline.
 
 The command performs a bounded, resumable pass through discovery, enrichment,
-quality filtering, Postgres persistence, and Qdrant indexing. Postgres is the
-source of truth; indexing without it requires an explicit development flag.
+quality filtering, and authenticated delivery to backend v2. The backend owns
+PostgreSQL identity and schedules ML/Qdrant work through its durable outbox.
 """
 
 from __future__ import annotations
@@ -137,8 +137,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description=(
-            "Corpus pipeline: Discovery → Enrichment → Quality Filter → "
-            "Postgres → Qdrant"
+            "Corpus pipeline: Discovery → Enrichment → Quality Filter → Backend v2"
         ),
     )
     parser.add_argument("--limit", type=_positive_int, default=150)
@@ -196,25 +195,10 @@ def _configuration_errors(args: argparse.Namespace) -> list[str]:
     token = os.getenv("GITHUB_TOKEN")
     if not token or token == "your_github_token_here":
         errors.append("GITHUB_TOKEN is missing or still uses the placeholder value")
-    if not args.allow_qdrant_without_postgres and not os.getenv("DATABASE_URL"):
-        errors.append("DATABASE_URL is required for production corpus ingestion")
-
-    if not args.no_index_qdrant:
-        try:
-            from embedding.repository_embedding import RepositoryEmbeddingConfig
-
-            RepositoryEmbeddingConfig(
-                model_name=args.embedding_model
-                or os.getenv("EMBEDDING_MODEL")
-                or "all-MiniLM-L6-v2"
-            )
-        except Exception as exc:
-            errors.append(f"embedding configuration is invalid: {exc}")
-        qdrant_url = args.qdrant_url or os.getenv(
-            "QDRANT_URL", "http://localhost:6333"
-        )
-        if not str(qdrant_url).strip():
-            errors.append("QDRANT_URL must not be empty when indexing is enabled")
+    if not os.getenv("BACKEND_URL"):
+        errors.append("BACKEND_URL is required for production corpus ingestion")
+    if not os.getenv("INTERNAL_API_SECRET"):
+        errors.append("INTERNAL_API_SECRET is required for production corpus ingestion")
     return errors
 
 
@@ -246,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     from acquisition.config import CorpusPipelineSettings
     from acquisition.corpus_pipeline import CorpusPipeline
     from acquisition.pipeline import enrich_repository_ids, run_acquisition_detailed
-    from database import PostgreSQLConnector
+    from acquisition.backend_client import BackendIngestionClient
 
     settings = CorpusPipelineSettings(
         target_count=args.corpus_target,
@@ -265,25 +249,21 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers,
         )
 
-    def index(sources: list[Any]):
-        return index_approved_repositories(
-            sources,
-            qdrant_url=args.qdrant_url,
-            qdrant_api_key=args.qdrant_api_key,
-            qdrant_collection=args.qdrant_collection,
-            embedding_model=args.embedding_model,
-        )
+    backend = BackendIngestionClient(
+        base_url=os.environ["BACKEND_URL"],
+        internal_secret=os.environ["INTERNAL_API_SECRET"],
+    )
 
     pipeline = CorpusPipeline(
-        database=PostgreSQLConnector(),
+        database=backend,
         acquire=acquire,
         acquire_retries=retry,
         quality_filter=filter_enriched,
-        indexer=index,
+        indexer=lambda _sources: [],
         settings=settings,
         checkpoint=CorpusCheckpoint(settings.checkpoint_path),
-        allow_qdrant_without_postgres=args.allow_qdrant_without_postgres,
-        indexing_enabled=not args.no_index_qdrant,
+        allow_qdrant_without_postgres=False,
+        indexing_enabled=False,
     )
     try:
         report = pipeline.run(

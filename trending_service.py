@@ -92,18 +92,6 @@ Examples:
         help="Validate configuration and exit without running",
     )
 
-    sync_group = parser.add_mutually_exclusive_group()
-    sync_group.add_argument(
-        "--sync-qdrant",
-        action="store_true",
-        help="Patch current trending signals onto existing Qdrant points",
-    )
-    sync_group.add_argument(
-        "--no-sync-qdrant",
-        action="store_true",
-        help="Disable Qdrant trend-signal synchronization",
-    )
-
     return parser.parse_args(argv)
 
 
@@ -132,11 +120,6 @@ def main(argv: list[str] | None = None):
         config.TRENDING_REFRESH_HOURS_STR = str(args.refresh_hours)
         logger.info(f"Override: TRENDING_REFRESH_HOURS = {args.refresh_hours}")
 
-    if args.sync_qdrant or args.no_sync_qdrant:
-        import trending.config as config
-        config.TRENDING_QDRANT_SYNC_STR = "true" if args.sync_qdrant else "false"
-        logger.info("Override: TRENDING_QDRANT_SYNC_ENABLED = %s", args.sync_qdrant)
-
     # Validate configuration (after CLI overrides)
     config_errors = validate_config()
     if config_errors:
@@ -146,6 +129,14 @@ def main(argv: list[str] | None = None):
         sys.exit(1)
 
     if args.validate_config:
+        missing = [
+            name for name in ("GITHUB_TOKEN", "BACKEND_URL", "INTERNAL_API_SECRET")
+            if not os.getenv(name)
+        ]
+        if missing:
+            for name in missing:
+                logger.error("  - %s is required", name)
+            sys.exit(1)
         logger.info("Configuration validation passed.")
         sys.exit(0)
 
@@ -156,12 +147,23 @@ def main(argv: list[str] | None = None):
 
     # Run in requested mode
     try:
+        from acquisition.backend_client import BackendIngestionClient
+        from trending.backend_storage import BackendTrendingStorage
+
+        backend = BackendIngestionClient(
+            base_url=os.environ["BACKEND_URL"],
+            internal_secret=os.environ["INTERNAL_API_SECRET"],
+        )
+        storage = BackendTrendingStorage(
+            backend=backend,
+            github_token=os.environ["GITHUB_TOKEN"],
+        )
         if args.scheduled:
             logger.info("Starting scheduled mode...")
-            run_scheduler()
+            run_scheduler(storage=storage)
         elif args.once:
             logger.info("Starting single refresh cycle...")
-            success = run_once(force=True)
+            success = run_once(force=True, storage=storage)
             if success:
                 logger.info("Single refresh cycle completed successfully.")
                 sys.exit(0)

@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
-
 import pytest
 
 from trending_service import parse_args
-from trending.qdrant_sync import TrendingQdrantSynchronizer, TrendingSyncResult
-from trending.scheduler import TrendingScheduler
+from trending.qdrant_sync import TrendingQdrantSynchronizer
 
 
 class _FailureIsolatingClient:
@@ -64,17 +61,11 @@ def test_qdrant_sync_flag_is_strictly_validated(monkeypatch) -> None:
     assert config.TRENDING_QDRANT_SYNC_ENABLED is True
 
 
-def test_trending_service_qdrant_flags_are_explicit_and_exclusive() -> None:
-    enabled = parse_args(["--once", "--sync-qdrant"])
-    disabled = parse_args(["--once", "--no-sync-qdrant"])
-
-    assert enabled.sync_qdrant is True
-    assert enabled.no_sync_qdrant is False
-    assert disabled.sync_qdrant is False
-    assert disabled.no_sync_qdrant is True
-
+def test_production_trending_service_rejects_direct_qdrant_flags() -> None:
     with pytest.raises(SystemExit):
-        parse_args(["--once", "--sync-qdrant", "--no-sync-qdrant"])
+        parse_args(["--once", "--sync-qdrant"])
+    with pytest.raises(SystemExit):
+        parse_args(["--once", "--no-sync-qdrant"])
 
 
 def test_sync_isolates_one_payload_failure_and_continues() -> None:
@@ -129,73 +120,3 @@ def test_sync_reports_repository_without_an_existing_qdrant_point() -> None:
     assert result.missing == ["owner/two"]
     assert result.failed == {}
     assert store.client.updates == []
-
-
-def _scheduler_dependencies(*, upserted_count: int):
-    repository = {
-        "full_name": "owner/repo",
-        "name": "repo",
-        "owner": "owner",
-        "daily_stars": 5,
-    }
-    fetcher = MagicMock()
-    fetcher.fetch_trending_repositories.return_value = [repository]
-    storage = MagicMock()
-    storage.enabled = True
-    storage.upsert_repositories.return_value = upserted_count
-    storage.get_last_refresh_time.return_value = None
-    synchronizer = MagicMock()
-    synchronizer.synchronize.return_value = TrendingSyncResult(updated=["owner/repo"])
-    return repository, fetcher, storage, synchronizer
-
-
-def test_scheduler_syncs_only_after_complete_postgres_refresh(monkeypatch) -> None:
-    monkeypatch.setattr("trending.scheduler.config.validate_config", lambda: [])
-    repository, fetcher, storage, synchronizer = _scheduler_dependencies(
-        upserted_count=1
-    )
-    scheduler = TrendingScheduler(
-        fetcher=fetcher,
-        storage=storage,
-        synchronizer=synchronizer,
-    )
-
-    assert scheduler.refresh_trending_repositories(force=True) is True
-
-    synchronizer.synchronize.assert_called_once()
-    args, kwargs = synchronizer.synchronize.call_args
-    assert args == ([repository],)
-    assert kwargs["refreshed_at"].tzinfo is not None
-
-
-def test_scheduler_skips_sync_after_partial_postgres_refresh(monkeypatch) -> None:
-    monkeypatch.setattr("trending.scheduler.config.validate_config", lambda: [])
-    _repository, fetcher, storage, synchronizer = _scheduler_dependencies(
-        upserted_count=0
-    )
-    scheduler = TrendingScheduler(
-        fetcher=fetcher,
-        storage=storage,
-        synchronizer=synchronizer,
-    )
-
-    assert scheduler.refresh_trending_repositories(force=True) is False
-
-    synchronizer.synchronize.assert_not_called()
-
-
-def test_scheduler_reports_qdrant_payload_failure(monkeypatch) -> None:
-    monkeypatch.setattr("trending.scheduler.config.validate_config", lambda: [])
-    _repository, fetcher, storage, synchronizer = _scheduler_dependencies(
-        upserted_count=1
-    )
-    synchronizer.synchronize.return_value = TrendingSyncResult(
-        failed={"owner/repo": "simulated failure"}
-    )
-    scheduler = TrendingScheduler(
-        fetcher=fetcher,
-        storage=storage,
-        synchronizer=synchronizer,
-    )
-
-    assert scheduler.refresh_trending_repositories(force=True) is False

@@ -37,8 +37,7 @@ class TrendingScheduler:
     def __init__(
         self,
         fetcher: TrendingFetcher | None = None,
-        storage: TrendingStorage | None = None,
-        synchronizer: Any | None = None,
+        storage: Any | None = None,
     ) -> None:
         """Initialize the trending scheduler.
 
@@ -56,7 +55,6 @@ class TrendingScheduler:
 
         self.fetcher = fetcher or TrendingFetcher()
         self.storage = storage or TrendingStorage()
-        self.synchronizer = synchronizer
         self.running = False
         self.scheduler = schedule.Scheduler()
 
@@ -148,34 +146,6 @@ class TrendingScheduler:
 
             logger.info(f"Successfully upserted {upserted_count} repositories to database.")
 
-            if self.synchronizer is not None or config.TRENDING_QDRANT_SYNC_ENABLED:
-                synchronizer = self.synchronizer
-                if synchronizer is None:
-                    from .qdrant_sync import TrendingQdrantSynchronizer
-
-                    synchronizer = TrendingQdrantSynchronizer()
-                sync_result = synchronizer.synchronize(
-                    repositories,
-                    refreshed_at=refresh_timestamp,
-                )
-                if sync_result.missing:
-                    logger.warning(
-                        "%d trending repositories have no existing Qdrant point: %s",
-                        len(sync_result.missing),
-                        ", ".join(sync_result.missing[:10]),
-                    )
-                if sync_result.failed:
-                    logger.error(
-                        "Trending Qdrant synchronization failed for %d repositories: %s",
-                        len(sync_result.failed),
-                        sync_result.failed,
-                    )
-                    return False
-                logger.info(
-                    "Synchronized trending signals for %d Qdrant points.",
-                    len(sync_result.updated),
-                )
-
             # Log summary
             last_refresh = self.storage.get_last_refresh_time()
             if last_refresh:
@@ -252,7 +222,7 @@ class TrendingScheduler:
         self.scheduler.clear()
 
 
-def run_scheduler() -> None:
+def run_scheduler(*, storage: Any | None = None) -> None:
     """Entry point for running the trending scheduler.
 
     This function starts the scheduled refresh cycle and blocks until
@@ -261,14 +231,14 @@ def run_scheduler() -> None:
     logger.info("Initializing trending scheduler...")
 
     try:
-        scheduler = TrendingScheduler()
+        scheduler = TrendingScheduler(storage=storage)
         scheduler.start_scheduled()
     except Exception as exc:
         logger.error(f"Failed to start trending scheduler: {exc}", exc_info=True)
         raise
 
 
-def run_once(force: bool = False) -> bool:
+def run_once(force: bool = False, *, storage: Any | None = None) -> bool:
     """Entry point for running a single refresh cycle.
 
     Args:
@@ -280,7 +250,7 @@ def run_once(force: bool = False) -> bool:
     logger.info("Initializing single refresh cycle...")
 
     try:
-        scheduler = TrendingScheduler()
+        scheduler = TrendingScheduler(storage=storage)
         return scheduler.start_once(force=force)
     except Exception as exc:
         logger.error(f"Failed to run single refresh cycle: {exc}", exc_info=True)

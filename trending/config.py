@@ -50,6 +50,8 @@ README_MAX_LENGTH: int = 10000  # Default, will be validated and cast in validat
 
 # PostgreSQL database URL (shared with main application)
 DATABASE_URL: str | None = os.getenv("DATABASE_URL")
+BACKEND_URL: str | None = os.getenv("BACKEND_URL")
+INTERNAL_API_SECRET: str | None = os.getenv("INTERNAL_API_SECRET")
 
 # Connection pool size for database operations
 DB_POOL_SIZE_STR: str = os.getenv("DB_POOL_SIZE", "5")
@@ -165,8 +167,5 @@ def validate_config() -> list[str]:
         errors.append(f"TRENDING_TABLE_NAME must match pattern {table_name_pattern}, got '{TRENDING_TABLE_NAME}'")
     if not re.match(table_name_pattern, TRENDING_METADATA_TABLE_NAME):
         errors.append(f"TRENDING_METADATA_TABLE_NAME must match pattern {table_name_pattern}, got '{TRENDING_METADATA_TABLE_NAME}'")
-
-    if not DATABASE_URL:
-        errors.append("DATABASE_URL is not set. Database integration will be disabled.")
 
     return errors

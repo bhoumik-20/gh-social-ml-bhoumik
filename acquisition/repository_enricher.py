@@ -217,6 +217,8 @@ class RepositoryEnricher:
 
         # Construct raw_repository (REST equivalent structure for downstream compatibility)
         raw_repository = {
+            "github_id": str(data.get("databaseId") or ""),
+            "github_node_id": data.get("id"),
             "full_name": full_name,
             "name": data.get("name"),
             "description": data.get("description"),
@@ -290,6 +292,9 @@ class RepositoryEnricher:
 
         return {
             "id": full_name,
+            "full_name": full_name,
+            "github_id": repository.get("github_id"),
+            "github_node_id": repository.get("github_node_id"),
             "star_count": int(repository.get("stargazers_count") or repository.get("watchers_count") or 0),
             "primary_language": primary_lang_str,
             "special_label": special_label,
@@ -311,6 +316,7 @@ class RepositoryEnricher:
             "created_at": repository.get("created_at"),
             "updated_at": repository.get("updated_at"),
             "pushed_at": repository.get("pushed_at"),
+            "observed_at": datetime.now(timezone.utc).isoformat(),
             "discovery_category": repository.get("_discovery_category"),
             "discovery_band": repository.get("_discovery_band"),
             "recent_commits": recent_commits or [],

@@ -32,7 +32,8 @@ def test_corpus_cli_value_overrides_invalid_environment_default(monkeypatch) -> 
 
 def test_corpus_config_validation_opens_no_network_connections(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://worker@localhost/corpus")
+    monkeypatch.setenv("BACKEND_URL", "http://backend.test")
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
     monkeypatch.setenv("CORPUS_TARGET_COUNT", "50000")
     monkeypatch.setenv("ACQUISITION_MAX_CYCLES", "1")
 
@@ -50,7 +51,8 @@ def test_corpus_config_validation_opens_no_network_connections(monkeypatch) -> N
 
 def test_corpus_config_validation_reports_missing_required_values(monkeypatch) -> None:
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+    monkeypatch.delenv("INTERNAL_API_SECRET", raising=False)
     monkeypatch.setenv("CORPUS_TARGET_COUNT", "50000")
 
     assert corpus_main(["--validate-config", "--no-index-qdrant"]) == 1
@@ -59,7 +61,9 @@ def test_corpus_config_validation_reports_missing_required_values(monkeypatch) -
 def test_trending_config_validation_does_not_start_worker(monkeypatch) -> None:
     import trending.config as config
 
-    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://worker@localhost/corpus")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("BACKEND_URL", "http://backend.test")
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-secret")
     with patch(
         "trending_service.run_once",
         side_effect=AssertionError("trending worker started"),
