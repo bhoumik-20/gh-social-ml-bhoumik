@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from collections.abc import Iterable
+import math
+from collections.abc import Iterable, Mapping
+from numbers import Integral, Real
+from typing import Any
 
 from config import (
     QDRANT_API_KEY,
@@ -16,12 +18,19 @@ from config import (
     REPOSITORY_EMBEDDING_DIM,
 )
 from .repository_embedding import RepositoryEmbeddingResult
+from .vector_contract import (
+    REPOSITORY_DISCOVERY_CHANNELS,
+    canonical_backend_uuid,
+    repository_point_id,
+    validate_embedding_vector,
+    validate_repository_payload,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class QdrantRepositoryStore:
-    """Creates and writes repository vectors to Qdrant."""
+    """Own the public repository-vector interface to Qdrant."""
 
     def __init__(
         self,
@@ -32,6 +41,7 @@ class QdrantRepositoryStore:
         vector_name: str = QDRANT_VECTOR_NAME,
         vector_size: int = REPOSITORY_EMBEDDING_DIM,
         distance: str = QDRANT_DISTANCE,
+        client: Any | None = None,
     ) -> None:
         try:
             from qdrant_client import QdrantClient
@@ -42,12 +52,13 @@ class QdrantRepositoryStore:
                 "Install dependencies from requirements.txt."
             ) from exc
 
-        self.client = QdrantClient(url=url, api_key=api_key)
         self.models = models
         self.collection_name = collection_name
         self.vector_name = vector_name
         self.vector_size = vector_size
         self.distance = distance
+        self._validate_store_config()
+        self.client = client if client is not None else QdrantClient(url=url, api_key=api_key)
 
     def ensure_collection(self) -> None:
         """Create or validate the repository collection and payload indexes."""
@@ -65,8 +76,7 @@ class QdrantRepositoryStore:
                 },
             )
             logger.info("Created Qdrant collection: %s", self.collection_name)
-        else:
-            self._validate_collection()
+        self._validate_collection()
 
         for field_name in QDRANT_PAYLOAD_INDEX_FIELDS:
             self._create_payload_index(field_name)
@@ -81,12 +91,23 @@ class QdrantRepositoryStore:
         """Upsert embedding results into Qdrant."""
         points = []
         for result in results:
+            point_id = self._point_id(result.repo_id)
+            vector = validate_embedding_vector(
+                result.final_embedding,
+                expected_size=self.vector_size,
+                field_name=f"embedding for {result.repo_id}",
+            )
+            validate_repository_payload(result.payload)
+            if result.payload["repo_id"].strip() != result.repo_id.strip():
+                raise ValueError(
+                    "embedding result repo_id does not match its repository payload"
+                )
             # The below deterministic ID is for safe re-runs; the same repo is
             # updated instead of inserted as a duplicate vector.
             points.append(
                 self.models.PointStruct(
-                    id=self._point_id(result.repo_id),
-                    vector={self.vector_name: result.final_embedding},
+                    id=point_id,
+                    vector={self.vector_name: vector},
                     payload=result.payload,
                 )
             )
@@ -102,38 +123,123 @@ class QdrantRepositoryStore:
         limit: int = 5,
         with_vectors: bool = False,
         exact: bool = True,
+        score_threshold: float | None = None,
+        query_filter: Any | None = None,
     ) -> list[dict]:
         """Search Qdrant by final repository embedding vector."""
         # The below query uses the named vector configured for repository
         # embeddings, so search targets the final repo embedding field. Exact
         # search is the default for evaluation-grade nearest-neighbor results.
+        query_vector = validate_embedding_vector(
+            vector,
+            expected_size=self.vector_size,
+            field_name="repository search vector",
+        )
+        self._validate_limit(limit)
+        if not isinstance(exact, bool):
+            raise TypeError("exact must be a boolean")
+        if score_threshold is not None:
+            if isinstance(score_threshold, bool) or not isinstance(score_threshold, Real):
+                raise TypeError("score_threshold must be a real number or None")
+            score_threshold = float(score_threshold)
+            if not math.isfinite(score_threshold):
+                raise ValueError("score_threshold must be finite")
+
         search_params = self.models.SearchParams(exact=exact)
         response = self.client.query_points(
             collection_name=self.collection_name,
-            query=vector,
+            query=query_vector,
             using=self.vector_name,
+            query_filter=query_filter,
             search_params=search_params,
             limit=limit,
             with_payload=True,
             with_vectors=with_vectors,
+            score_threshold=score_threshold,
         )
-        results = []
-        for point in response.points:
-            payload = point.payload or {}
-            results.append(
-                {
-                    "id": str(point.id),
-                    "score": float(point.score),
-                    "repo_id": payload.get("repo_id"),
-                    "full_name": payload.get("full_name"),
-                    "payload": payload,
-                    "vector": point.vector if with_vectors else None,
-                }
-            )
-        return results
+        return [self._format_point(point, with_vectors=with_vectors) for point in response.points]
+
+    def semantic_search(
+        self,
+        vector: list[float],
+        *,
+        limit: int = 50,
+        with_vectors: bool = True,
+        score_threshold: float | None = None,
+        query_filter: Any | None = None,
+        exact: bool = False,
+    ) -> list[dict]:
+        """Run semantic retrieval with approximate search as the production default."""
+        return self.search(
+            vector,
+            limit=limit,
+            with_vectors=with_vectors,
+            exact=exact,
+            score_threshold=score_threshold,
+            query_filter=query_filter,
+        )
+
+    def discover(
+        self,
+        channel: str,
+        *,
+        limit: int = 50,
+        with_vectors: bool = True,
+        query_filter: Any | None = None,
+    ) -> list[dict]:
+        """Return repositories ordered by a frozen discovery channel."""
+        if not isinstance(channel, str):
+            raise TypeError("channel must be a string")
+        canonical_channel = channel.strip().lower()
+        order_field = REPOSITORY_DISCOVERY_CHANNELS.get(canonical_channel)
+        if order_field is None:
+            allowed = ", ".join(REPOSITORY_DISCOVERY_CHANNELS)
+            raise ValueError(f"Unsupported discovery channel {channel!r}. Use one of: {allowed}")
+        self._validate_limit(limit)
+
+        records, _ = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=query_filter,
+            limit=limit,
+            order_by=self.models.OrderBy(
+                key=order_field,
+                direction=self.models.Direction.DESC,
+            ),
+            with_payload=True,
+            with_vectors=[self.vector_name] if with_vectors else False,
+        )
+        return [self._format_point(record, with_vectors=with_vectors) for record in records]
+
+    def retrieve_batch(
+        self,
+        repo_ids: Iterable[str],
+        *,
+        with_vectors: bool = True,
+    ) -> list[dict]:
+        """Retrieve repositories by stable repo ID in one Qdrant request.
+
+        Duplicate IDs are requested once, and results follow the caller's
+        original ID order even if Qdrant returns records in another order.
+        """
+        canonical_repo_ids = self._canonical_repo_ids(repo_ids)
+        if not canonical_repo_ids:
+            return []
+        point_ids = [repository_point_id(repo_id) for repo_id in canonical_repo_ids]
+        records = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=[self.vector_name] if with_vectors else False,
+        )
+        by_point_id = {
+            str(record.id): self._format_point(record, with_vectors=with_vectors)
+            for record in records
+        }
+        return [by_point_id[point_id] for point_id in point_ids if point_id in by_point_id]
 
     def list_points(self, *, limit: int = 100, with_vectors: bool = True) -> list[dict]:
         """Load repository points from Qdrant for offline evaluation."""
+        self._validate_limit(limit)
         points: list[dict] = []
         offset = None
         while len(points) < limit:
@@ -148,22 +254,31 @@ class QdrantRepositoryStore:
             )
             if not records:
                 break
-            for record in records:
-                payload = record.payload or {}
-                vector = None
-                if with_vectors:
-                    vector = self._extract_vector(record.vector)
-                points.append(
-                    {
-                        "id": str(record.id),
-                        "repo_id": payload.get("repo_id"),
-                        "payload": payload,
-                        "vector": vector,
-                    }
-                )
+            points.extend(
+                self._format_point(record, with_vectors=with_vectors) for record in records
+            )
             if offset is None:
                 break
         return points
+
+    def _format_point(self, point: Any, *, with_vectors: bool) -> dict:
+        payload = point.payload or {}
+        vector = self._extract_vector(point.vector) if with_vectors else None
+        if vector is not None:
+            vector = validate_embedding_vector(
+                vector,
+                expected_size=self.vector_size,
+                field_name=f"stored embedding for point {point.id}",
+            )
+        raw_score = getattr(point, "score", None)
+        return {
+            "id": str(point.id),
+            "score": float(raw_score) if raw_score is not None else None,
+            "repo_id": payload.get("repo_id"),
+            "full_name": payload.get("full_name"),
+            "payload": payload,
+            "vector": vector,
+        }
 
     def _extract_vector(self, vector_data) -> list[float] | None:
         if vector_data is None:
@@ -185,7 +300,7 @@ class QdrantRepositoryStore:
     def _validate_collection(self) -> None:
         info = self.client.get_collection(self.collection_name)
         vectors = info.config.params.vectors
-        vector_config = vectors.get(self.vector_name) if isinstance(vectors, dict) else vectors
+        vector_config = vectors.get(self.vector_name) if isinstance(vectors, Mapping) else None
         if vector_config is None:
             raise ValueError(
                 f"Qdrant collection {self.collection_name!r} does not define vector "
@@ -203,13 +318,37 @@ class QdrantRepositoryStore:
                 f"uses distance {vector_config.distance}, expected {expected_distance}."
             )
 
+    def _validate_store_config(self) -> None:
+        for field_name, value in (
+            ("collection_name", self.collection_name),
+            ("vector_name", self.vector_name),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if (
+            isinstance(self.vector_size, bool)
+            or not isinstance(self.vector_size, Integral)
+            or self.vector_size <= 0
+        ):
+            raise ValueError("vector_size must be a positive integer")
+        if not isinstance(self.distance, str) or not self.distance.strip():
+            raise ValueError("distance must be a non-empty string")
+        self._distance()
+
     def _create_payload_index(self, field_name: str) -> None:
         # The below schema selection is for keeping payload indexes aligned with
         # the payload fields emitted by build_vector_payload.
         schema = self.models.PayloadSchemaType.KEYWORD
-        if field_name in {"star_count"}:
+        if field_name in {"star_count", "pushed_days_ago"}:
             schema = self.models.PayloadSchemaType.INTEGER
-        if field_name in {"updated_at", "pushed_at"}:
+        elif field_name in {
+            "trend_velocity",
+            "activity_score",
+            "doc_quality",
+            "code_health",
+        }:
+            schema = self.models.PayloadSchemaType.FLOAT
+        elif field_name in {"updated_at", "pushed_at"}:
             schema = self.models.PayloadSchemaType.DATETIME
         try:
             self.client.create_payload_index(
@@ -218,15 +357,35 @@ class QdrantRepositoryStore:
                 field_schema=schema,
             )
         except Exception as exc:
-            logger.debug("Payload index skipped for %s: %s", field_name, exc)
+            raise RuntimeError(f"Failed to create Qdrant payload index {field_name!r}") from exc
+
+    @staticmethod
+    def _validate_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, Integral) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+
+    @staticmethod
+    def _canonical_repo_ids(repo_ids: Iterable[str]) -> list[str]:
+        if isinstance(repo_ids, (str, bytes)):
+            raise TypeError("repo_ids must be an iterable of repository ID strings")
+        canonical: list[str] = []
+        seen: set[str] = set()
+        for repo_id in repo_ids:
+            normalized = canonical_backend_uuid(repo_id, field_name="repo_id")
+            if normalized not in seen:
+                seen.add(normalized)
+                canonical.append(normalized)
+        return canonical
 
     @staticmethod
     def _point_id(repo_id: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_id}"))
+        return repository_point_id(repo_id)
 
     def _distance(self):
         try:
             return getattr(self.models.Distance, self.distance.upper())
         except AttributeError as exc:
             allowed = ", ".join(item.name for item in self.models.Distance)
-            raise ValueError(f"Unsupported Qdrant distance {self.distance!r}. Use one of: {allowed}") from exc
+            raise ValueError(
+                f"Unsupported Qdrant distance {self.distance!r}. Use one of: {allowed}"
+            ) from exc

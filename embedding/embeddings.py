@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Real
 
 import numpy as np
 
 from config import README_CHUNK_CHARS, README_CHUNK_OVERLAP_CHARS, REPOSITORY_EMBEDDING_MODEL
+from .vector_contract import validate_embedding_vector
 
 logger = logging.getLogger(__name__)
 
@@ -105,29 +108,56 @@ def chunk_text(
     return chunks
 
 
-def aggregate_vectors(vectors: Sequence[Sequence[float]], *, weights: Sequence[float] | None = None) -> Vector:
+def aggregate_vectors(
+    vectors: Sequence[Sequence[float]],
+    *,
+    weights: Sequence[float] | None = None,
+) -> Vector:
     """Average and L2-normalize vectors."""
     if not vectors:
         return []
 
-    matrix = np.asarray(vectors, dtype=np.float32)
+    expected_size = len(vectors[0])
+    if expected_size == 0:
+        raise ValueError("vectors must not contain empty vectors")
+    validated_vectors = [
+        validate_embedding_vector(
+            vector,
+            expected_size=expected_size,
+            field_name=f"vectors[{index}]",
+        )
+        for index, vector in enumerate(vectors)
+    ]
+    matrix = np.asarray(validated_vectors, dtype=np.float32)
     if weights is not None:
-        weight_array = np.asarray(weights, dtype=np.float32)
-        if len(weight_array) != len(matrix):
+        if len(weights) != len(matrix):
             raise ValueError("weights length must match vectors length")
+        validated_weights: list[float] = []
+        for index, raw_weight in enumerate(weights):
+            if isinstance(raw_weight, bool) or not isinstance(raw_weight, Real):
+                raise TypeError(f"weights[{index}] must be a real number")
+            weight = float(raw_weight)
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(f"weights[{index}] must be finite and non-negative")
+            validated_weights.append(weight)
+        weight_array = np.asarray(validated_weights, dtype=np.float32)
         total = float(weight_array.sum())
         if total <= 0:
-            weight_array = np.ones(len(matrix), dtype=np.float32)
-            total = float(weight_array.sum())
+            raise ValueError("weights must have a positive total")
         vector = np.average(matrix, axis=0, weights=weight_array / total)
     else:
         vector = np.mean(matrix, axis=0)
 
     # The below normalization is for cosine-distance storage in Qdrant.
     norm = float(np.linalg.norm(vector))
-    if norm:
-        vector = vector / norm
-    return vector.astype(np.float32).tolist()
+    if not math.isfinite(norm) or norm <= 0:
+        raise ValueError("cannot normalize a zero-length or non-finite aggregate vector")
+    vector = vector / norm
+    return validate_embedding_vector(
+        vector.astype(np.float32).tolist(),
+        expected_size=expected_size,
+        field_name="aggregate vector",
+    )
 
 
 def _best_chunk_boundary(text: str, start: int, hard_end: int) -> int:

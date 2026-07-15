@@ -19,6 +19,7 @@ from .repository_embedding import (
     combine_repo_tower,
     source_fingerprint,
 )
+from .vector_contract import resolve_repository_identity, validate_embedding_vector
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,9 @@ class RepositoryEmbeddingPipeline:
     def embed_repository(self, source: Any) -> RepositoryEmbeddingResult:
         """Embed one approved repository payload or EnrichmentResult."""
         repo = coerce_payload(source)
-        repo_id = str(repo.get("id") or "unknown/repository")
+        repo_id, full_name = resolve_repository_identity(repo)
+        repo["repo_id"] = repo_id
+        repo["full_name"] = full_name
         # The below text builders are for splitting source material into the
         # three approved towers before final weighted composition.
         readme_text = build_readme_text(source)
@@ -64,7 +67,11 @@ class RepositoryEmbeddingPipeline:
             topic_embedding=topic_embedding,
             weights=self.config.tower_weights,
         )
-        self._validate_embedding_dim(repo_id, final_embedding)
+        final_embedding = validate_embedding_vector(
+            final_embedding,
+            expected_size=self.config.embedding_dim,
+            field_name=f"embedding for {repo_id}",
+        )
 
         source_hash = source_fingerprint(
             self.config.model_name,
@@ -114,19 +121,17 @@ class RepositoryEmbeddingPipeline:
         """Embed a text query and search the configured Qdrant collection."""
         # The below query embedding is for searching with the same model/config
         # used during repository indexing.
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
         if self.store is None:
             self.store = QdrantRepositoryStore(vector_size=self.config.embedding_dim)
         self.store.validate_collection()
-        query_vector = self.embedder.embed_text(query)
-        self._validate_embedding_dim("query", query_vector)
+        query_vector = validate_embedding_vector(
+            self.embedder.embed_text(query),
+            expected_size=self.config.embedding_dim,
+            field_name="query embedding",
+        )
         return self.store.search(query_vector, limit=limit, exact=exact)
-
-    def _validate_embedding_dim(self, label: str, vector: list[float]) -> None:
-        if len(vector) != self.config.embedding_dim:
-            raise ValueError(
-                f"Embedding for {label} has dimension {len(vector)}, "
-                f"expected {self.config.embedding_dim}."
-            )
 
 
 def embed_repositories(
