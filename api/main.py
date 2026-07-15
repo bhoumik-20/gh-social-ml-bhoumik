@@ -1,99 +1,58 @@
+"""Production API for feedback ingestion and ML operations."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+import hmac
+import importlib
 import logging
+import math
 import os
+from typing import Any, Literal
 from uuid import UUID
 
-# Load .env FIRST — before any imports that call os.getenv() at module level
-# (e.g. scripts/user_onboarding.py reads QDRANT_URL on import)
-from dotenv import load_dotenv
-load_dotenv()
-
-# Force PyTorch and underlying math libraries to use a single thread to save RAM during deployment
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["MALLOC_ARENA_MAX"] = "2"
-
-from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from qdrant_client import QdrantClient
 
-from feedback.producer import FeedbackProducer
 from feedback.consumer import FeedbackConsumer
-from feedback.interactions import INTERACTIONS, get_interaction
-from feedback.storage import FeedbackStore
-from retrieval_engine import RetrievalEngine
-from scripts.user_onboarding import UserOnboardingPipeline
-from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
+from feedback.event_handlers import FeedbackHandler
+from feedback.interactions import INTERACTIONS, get_interaction, normalize_interaction
+from feedback.producer import FeedbackProducer, create_redis_client
+from feedback.settings import FeedbackSettings
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("pipeline.api")
 
-import hmac
-
-# ── Shared-secret guard ──────────────────────────────────────────────────────
-
-async def require_internal_secret(
-    x_internal_secret: str | None = Header(default=None, alias="x-internal-secret"),
-) -> None:
-    """FastAPI dependency that validates the X-Internal-Secret header.
-
-    Fails closed (503) if INTERNAL_API_SECRET is not configured on this server
-    so a misconfigured deploy is never accidentally open.
-    """
-    internal_secret = os.getenv("INTERNAL_API_SECRET")
-    if not internal_secret:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Internal API secret is not configured on this server.",
-        )
-    if not x_internal_secret or not hmac.compare_digest(x_internal_secret.encode("utf-8"), internal_secret.encode("utf-8")):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: invalid or missing X-Internal-Secret header.",
-        )
-
-
-# Global instances
 producer: FeedbackProducer | None = None
 consumer: FeedbackConsumer | None = None
-retrieval_engine: RetrievalEngine | None = None
-onboarding_pipeline: UserOnboardingPipeline | None = None
-repo_embedding_pipeline: RepositoryEmbeddingPipeline | None = None
-feedback_store: FeedbackStore | None = None
+feedback_handler: FeedbackHandler | None = None
+retrieval_engine: Any | None = None
+onboarding_pipeline: Any | None = None
+repo_embedding_pipeline: Any | None = None
 
 
 class FeedbackRequest(BaseModel):
-    user_id: UUID = Field(..., description="Application user UUID performing the action")
-    repo_id: str = Field(..., description="Full name or UUID of the repository")
-    action: str = Field(
-        ...,
-        description="Versioned feedback action type",
-    )
-    dwell_seconds: float | None = Field(
-        default=None,
-        gt=0,
-        description=(
-            "Observed dwell time in seconds. Required when action is 'dwell'; "
-            "ignored for all other actions."
-        ),
-    )
+    event_id: str = Field(..., min_length=1, max_length=128)
+    user_id: UUID
+    repo_id: str = Field(..., min_length=1)
+    action: str = Field(..., min_length=1)
+    occurred_at: datetime
+    schema_version: Literal[1] = 1
+    dwell_seconds: float | None = Field(default=None, ge=0)
 
 
 class RecommendationRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
-    is_cold_start: bool = Field(default=False, description="True if user has zero interactions")
+    user_id: str = Field(..., min_length=1)
+    is_cold_start: bool = False
 
 
 class OnboardingRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, description="Application user UUID")
-    github_username: str | None = Field(default=None, description="Linked GitHub username")
+    user_id: str = Field(..., min_length=1)
+    github_username: str | None = None
     username: str | None = None
     full_name: str | None = None
     bio: str | None = None
@@ -104,8 +63,8 @@ class OnboardingRequest(BaseModel):
 
 
 class EmbedRepoRequest(BaseModel):
-    repo_id: str = Field(..., min_length=1, description="Backend repository UUID")
-    github_repo: str = Field(..., min_length=1, description="GitHub owner/name")
+    repo_id: str = Field(..., min_length=1)
+    github_repo: str = Field(..., min_length=1)
     github_repo_url: str | None = None
     description: str | None = None
     primary_language: str | None = None
@@ -119,225 +78,186 @@ class EmbedRepoRequest(BaseModel):
     updated_at: str | None = None
 
 
+def _build_feedback_runtime(
+    settings: FeedbackSettings,
+) -> tuple[FeedbackProducer, FeedbackConsumer, FeedbackHandler]:
+    redis_client = create_redis_client(settings)
+    qdrant = QdrantClient(
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key,
+        timeout=30.0,
+    )
+    handler = FeedbackHandler(qdrant_client=qdrant, settings=settings)
+    stream_producer = FeedbackProducer(redis_client=redis_client, settings=settings)
+    stream_consumer = FeedbackConsumer(
+        handler=handler, redis_client=redis_client, settings=settings
+    )
+    return stream_producer, stream_consumer, handler
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager to initialize components and background worker tasks."""
-    global producer, consumer, retrieval_engine, onboarding_pipeline, repo_embedding_pipeline, feedback_store
-    logger.info("Initializing API components...")
-    producer = FeedbackProducer()
-    consumer = FeedbackConsumer()
-    retrieval_engine = RetrievalEngine()
-    onboarding_pipeline = UserOnboardingPipeline()
-    repo_embedding_pipeline = RepositoryEmbeddingPipeline()
-    feedback_store = FeedbackStore()
-    feedback_store.init_schema()
-    
-    # Start background event consume worker loop
+    """Start validated feedback dependencies and exactly one consumer task."""
+    global producer, consumer, feedback_handler
+    settings = FeedbackSettings.from_env()
+    if settings.production and not os.getenv("INTERNAL_API_SECRET"):
+        raise RuntimeError("INTERNAL_API_SECRET is required in production")
+    producer, consumer, feedback_handler = _build_feedback_runtime(settings)
+    await producer.start()
+    await asyncio.to_thread(feedback_handler.healthy)
     await consumer.start()
-    logger.info("Feedback Ingestion API and Background Consumer started successfully.")
-    
-    yield
-    
-    # Shutdown components
-    logger.info("Shutting down API components...")
-    if consumer:
-        consumer.stop()
-    logger.info("API components shut down.")
+    app.state.feedback_settings = settings
+    try:
+        yield
+    finally:
+        if consumer:
+            await consumer.stop()
+        redis_client = producer.redis_client if producer else None
+        close = getattr(redis_client, "close", None)
+        if close:
+            await asyncio.to_thread(close)
+        qdrant_client = feedback_handler.qdrant if feedback_handler else None
+        close_qdrant = getattr(qdrant_client, "close", None)
+        if close_qdrant:
+            await asyncio.to_thread(close_qdrant)
+        producer = None
+        consumer = None
+        feedback_handler = None
 
 
 app = FastAPI(
-    title="Git Social ML - Feedback Ingestion API",
-    description="Real-time ingestion endpoint for user feedback events to update recommendations.",
+    title="Git Social ML API",
+    description="Authenticated ML operations and durable feedback ingestion.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
+@app.middleware("http")
+async def authenticate_non_health_routes(request: Request, call_next):
+    """Fail closed for every route except the single health endpoint."""
+    if request.url.path == "/api/v1/health":
+        return await call_next(request)
+    secret = os.getenv("INTERNAL_API_SECRET")
+    if not secret:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Internal API authentication is not configured."},
+        )
+    header_name = os.getenv("INTERNAL_API_HEADER", "x-internal-secret").lower()
+    supplied = request.headers.get(header_name)
+    if not supplied or not hmac.compare_digest(supplied, secret):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Unauthorized."},
+        )
+    return await call_next(request)
+
+
 @app.post("/api/v1/feedback", status_code=status.HTTP_202_ACCEPTED)
 async def submit_feedback(request: FeedbackRequest):
-    """Submit a user interaction event.
-
-    Pushes the event to the processing queue and returns 202 Accepted.
-    Supported actions are the versioned feedback contract actions plus ``dwell``.
-    When ``action`` is ``dwell``, ``dwell_seconds`` must be provided and > 0.
-    """
-    action = request.action.lower()
-    valid_actions = set(INTERACTIONS) | {"dwell"}
-    if action not in valid_actions:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid action: '{request.action}'. Supported actions are: {sorted(valid_actions)}",
-        )
-
-    # Validate dwell-specific contract
-    if action == "dwell" and request.dwell_seconds is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="'dwell_seconds' is required when action is 'dwell'.",
-        )
-
+    action = normalize_interaction(request.action)
     try:
-        # Enqueue the event (dwell_seconds is forwarded as keyword-only arg)
-        success = await producer.submit_feedback(
-            user_id=str(request.user_id),
-            repo_id=request.repo_id,
-            action=action,
-            dwell_seconds=request.dwell_seconds,
-        )
+        definition = get_interaction(action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.dwell_seconds is not None and not math.isfinite(request.dwell_seconds):
+        raise HTTPException(status_code=422, detail="dwell_seconds must be finite")
+    if request.occurred_at.tzinfo is None:
+        raise HTTPException(status_code=422, detail="occurred_at must include a timezone")
+    if action == "dwell" and request.dwell_seconds is None:
+        raise HTTPException(status_code=422, detail="dwell_seconds is required for dwell")
+    if action != "dwell" and request.dwell_seconds is not None:
+        raise HTTPException(status_code=422, detail="dwell_seconds is only valid for dwell")
 
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to enqueue feedback event.",
+    queued = False
+    if definition.realtime:
+        if producer is None:
+            raise HTTPException(status_code=503, detail="Feedback stream is unavailable.")
+        try:
+            await producer.submit_feedback(
+                user_id=str(request.user_id),
+                repo_id=request.repo_id,
+                action=action,
+                event_id=str(request.event_id),
+                occurred_at=request.occurred_at.isoformat(),
+                schema_version=request.schema_version,
+                dwell_seconds=request.dwell_seconds,
             )
+            queued = True
+        except Exception:
+            logger.exception("Unable to publish feedback event %s", request.event_id)
+            raise HTTPException(status_code=503, detail="Feedback stream is unavailable.")
 
-        response_data: dict = {
+    return {
+        "status": "accepted",
+        "data": {
+            "event_id": str(request.event_id),
             "user_id": str(request.user_id),
             "repo_id": request.repo_id,
             "action": action,
-        }
-        if action != "dwell":
-            response_data["feedback_score"] = get_interaction(action).feedback_score
-        if request.dwell_seconds is not None:
-            response_data["dwell_seconds"] = request.dwell_seconds
-
-        return {
-            "status": "accepted",
-            "message": "Feedback event received and queued successfully.",
-            "data": response_data,
-        }
-
-    except HTTPException:
-        # Re-raise HTTPExceptions explicitly to prevent wrapping them in 500
-        raise
-    except Exception as exc:
-        logger.error("Failed to process feedback submission: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal API error: {str(exc)}",
-        )
+            "reference_score": definition.reference_score,
+            "queued_for_realtime_ml": queued,
+        },
+    }
 
 
-@app.get("/api/v1/feedback/{user_id}", dependencies=[Depends(require_internal_secret)])
-async def get_user_feedback(user_id: str):
-    """Return the user's persisted effective feedback records."""
-    if feedback_store is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Feedback store is not initialized.",
-        )
-    try:
-        records = await run_in_threadpool(feedback_store.list_for_user, user_id)
-        return {
-            "status": "success",
-            "user_id": user_id,
-            "data": [
-                {
-                    "user_id": record.user_id,
-                    "repo_id": record.repo_id,
-                    "interaction_type": record.interaction_type,
-                    "feedback_score": record.feedback_score,
-                    "timestamp": record.updated_at,
-                }
-                for record in records
-            ],
-        }
-    except Exception as exc:
-        logger.exception("Failed to retrieve feedback for '%s'", user_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve feedback: {str(exc)}",
-        )
+def _load_service(module_name: str, class_name: str) -> Any:
+    """Load other owned workstreams only when their endpoint is called."""
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)()
 
 
-@app.post("/api/v1/recommendations/generate", dependencies=[Depends(require_internal_secret)])
+@app.post("/api/v1/recommendations/generate")
 async def generate_recommendations(request: RecommendationRequest):
-    """Generate ranked recommendation batches for a user."""
-    if retrieval_engine is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Recommendation engine is not initialized.",
-        )
-
+    global retrieval_engine
     try:
+        retrieval_engine = retrieval_engine or _load_service("retrieval_engine", "RetrievalEngine")
         batches = await run_in_threadpool(
             retrieval_engine.fetch_onboarding_batches,
             request.user_id,
             is_cold_start=request.is_cold_start,
         )
-        return {
-            "status": "success",
-            "user_id": request.user_id,
-            "data": batches,
-        }
+        return {"status": "success", "user_id": request.user_id, "data": batches}
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
-        )
-    except Exception as exc:
-        logger.exception("Recommendation generation failed for user '%s'", request.user_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate recommendations: {str(exc)}",
-        )
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Recommendation generation failed for %s", request.user_id)
+        raise HTTPException(status_code=500, detail="Recommendation generation failed.")
 
 
-@app.post("/api/v1/onboard", dependencies=[Depends(require_internal_secret)])
+@app.post("/api/v1/onboard")
 async def onboard_user(request: OnboardingRequest):
-    """Create or update a user's Qdrant profile embedding."""
-    if onboarding_pipeline is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Onboarding pipeline is not initialized.",
-        )
-
-    user_data = request.model_dump(exclude_none=True)
-    user_id = user_data.pop("user_id")
-    github_username = user_data.pop("github_username", None)
-    if github_username:
-        user_data["github_username"] = github_username
-
+    global onboarding_pipeline
+    onboarding_pipeline = onboarding_pipeline or _load_service(
+        "scripts.user_onboarding", "UserOnboardingPipeline"
+    )
+    data = request.model_dump(exclude_none=True)
+    user_id = data.pop("user_id")
     try:
-        success = await run_in_threadpool(
-            onboarding_pipeline.onboard_user,
-            user_id,
-            user_data,
-        )
+        success = await run_in_threadpool(onboarding_pipeline.onboard_user, user_id, data)
         if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="User onboarding pipeline failed.",
-            )
+            raise HTTPException(status_code=500, detail="User onboarding failed.")
         return {"status": "success", "user_id": user_id}
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        )
-    except Exception as exc:
-        logger.exception("User onboarding failed for '%s'", user_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to onboard user: {str(exc)}",
-        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("User onboarding failed for %s", user_id)
+        raise HTTPException(status_code=500, detail="User onboarding failed.")
 
 
-@app.post("/api/v1/embed-repo", dependencies=[Depends(require_internal_secret)])
+@app.post("/api/v1/embed-repo")
 async def embed_repo(request: EmbedRepoRequest):
-    """Embed a repository and upsert its vector into Qdrant."""
-    if repo_embedding_pipeline is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Repository embedding pipeline is not initialized.",
-        )
-
+    global repo_embedding_pipeline
+    repo_embedding_pipeline = repo_embedding_pipeline or _load_service(
+        "embedding.embedding_pipeline", "RepositoryEmbeddingPipeline"
+    )
     payload = {
         "id": request.repo_id,
-        "full_name": request.github_repo,
         "repo_id": request.repo_id,
+        "full_name": request.github_repo,
         "html_url": request.github_repo_url,
         "description": request.description or "",
         "primary_language": request.primary_language or "Unknown",
@@ -351,7 +271,6 @@ async def embed_repo(request: EmbedRepoRequest):
         "created_at": request.created_at,
         "updated_at": request.updated_at,
     }
-
     try:
         results = await run_in_threadpool(repo_embedding_pipeline.index_batch, [payload])
         result = results[0] if results else None
@@ -359,25 +278,34 @@ async def embed_repo(request: EmbedRepoRequest):
             "status": "success",
             "repo_id": request.repo_id,
             "github_repo": request.github_repo,
-            "embedding_version": result.embedding_version if result else None,
+            "embedding_version": getattr(result, "embedding_version", None),
         }
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        )
-    except Exception as exc:
-        logger.exception("Repository embedding failed for '%s'", request.github_repo)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to embed repository: {str(exc)}",
-        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("Repository embedding failed for %s", request.github_repo)
+        raise HTTPException(status_code=500, detail="Repository embedding failed.")
 
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Basic service health check."""
-    return {
-        "status": "healthy",
-        "consumer_running": consumer.running if consumer else False,
-    }
+    checks = {"lifecycle": producer is not None and feedback_handler is not None}
+    checks["consumer"] = bool(consumer and consumer.healthy)
+    try:
+        checks["redis"] = bool(
+            producer and producer.redis_client
+            and await asyncio.to_thread(producer.redis_client.ping)
+        )
+    except Exception:
+        checks["redis"] = False
+    try:
+        checks["qdrant"] = bool(
+            feedback_handler and await asyncio.to_thread(feedback_handler.healthy)
+        )
+    except Exception:
+        checks["qdrant"] = False
+    healthy = all(checks.values())
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={"status": "healthy" if healthy else "unhealthy", "checks": checks},
+    )

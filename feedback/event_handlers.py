@@ -1,108 +1,133 @@
-import logging
-import os
-import uuid
-import numpy as np
-import math
-from typing import Any, Dict, List, Optional
+"""Qdrant-only feedback state transitions and user-vector learning."""
 
+from __future__ import annotations
+
+import copy
+import logging
+import math
+import uuid
+from typing import Any, Mapping, Sequence
+
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
-from database.connector import PostgreSQLConnector
-from config import (
-    QDRANT_URL,
-    QDRANT_API_KEY,
-    QDRANT_COLLECTION_NAME,
-    EMBEDDING_DIM,
-    MIN_DWELL_SECONDS,
-    MAX_DWELL_SECONDS,
-    DWELL_BASE_ALPHA,
-)
-from scripts.user_onboarding import USER_PROFILES_COLLECTION, TARGET_VECTOR_NAME
 from .interactions import get_interaction, normalize_interaction
-from .storage import FeedbackStore
+from .settings import FeedbackSettings
 
 logger = logging.getLogger("pipeline.feedback")
-
-# Action-weights for vector adjustment (learning rate \alpha)
-
-# PostgreSQL column mapping for repository engagement stats.
-# "dwell" maps to None — it only updates the Qdrant embedding, not a Postgres counter.
-METRIC_COLUMNS = {
-    "dwell": None,   # no Postgres column — embedding-only signal
-}
+LATENT_KEY = "feedback_latent_vector"
+ADJUSTMENTS_KEY = "feedback_adjustments"
+PROCESSED_KEY = "feedback_processed_events"
 
 
-def _dwell_alpha(dwell_seconds: float) -> Optional[float]:
-    """Map raw dwell time to an embedding shift strength (alpha).
-
-    Uses log-linear scaling so that short dwells produce small shifts
-    and long engaged reads approach DWELL_BASE_ALPHA.
-
-    Returns
-    -------
-    float  — learning rate to pass to shift_vector
-    None   — dwell is below MIN_DWELL_SECONDS (accidental scroll); ignore update
-    """
-    # The below threshold is for filtering out accidental card flicks that
-    # should not influence the interest vector at all.
-    if dwell_seconds < MIN_DWELL_SECONDS:
+def dwell_alpha(
+    dwell_seconds: float,
+    *,
+    minimum_seconds: float = 3.0,
+    full_credit_seconds: float = 300.0,
+    maximum_alpha: float = 0.15,
+) -> float | None:
+    """Return a linear, bounded dwell alpha, or None below the threshold."""
+    value = float(dwell_seconds)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("dwell_seconds must be finite and non-negative")
+    if full_credit_seconds <= minimum_seconds:
+        raise ValueError("full_credit_seconds must exceed minimum_seconds")
+    if value < minimum_seconds:
         return None
-    # Log-linear: consistent with how trend_velocity is clamped in retrieval_engine.py.
-    ratio = math.log1p(dwell_seconds) / math.log1p(MAX_DWELL_SECONDS)
-    return DWELL_BASE_ALPHA * min(ratio, 1.0)
+    progress = (value - minimum_seconds) / (full_credit_seconds - minimum_seconds)
+    return min(maximum_alpha, maximum_alpha * max(0.0, progress))
 
 
-def shift_vector(user_vec: List[float], repo_vec: List[float], alpha: float) -> List[float]:
-    """Shift user vector towards (or away from) repo vector and L2 normalize."""
-    u = np.array(user_vec, dtype=np.float32)
-    r = np.array(repo_vec, dtype=np.float32)
+def _dwell_alpha(dwell_seconds: float) -> float | None:
+    settings = FeedbackSettings.from_env()
+    return dwell_alpha(
+        dwell_seconds,
+        minimum_seconds=settings.dwell_min_seconds,
+        full_credit_seconds=settings.dwell_full_credit_seconds,
+        maximum_alpha=settings.dwell_max_alpha,
+    )
 
-    # Shift formula: V_user_new = V_user + \alpha * V_repo
-    updated = u + alpha * r
 
-    # Re-normalize to unit length (L2 norm)
-    norm = np.linalg.norm(updated)
-    if norm > 0:
-        updated = updated / norm
+def _vector(value: Sequence[float], dimension: int, *, label: str) -> np.ndarray:
+    result = np.asarray(value, dtype=np.float64)
+    if result.ndim != 1 or len(result) != dimension:
+        raise ValueError(f"{label} must contain exactly {dimension} values")
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{label} contains a non-finite value")
+    return result
 
-    return updated.tolist()
+
+def normalize_vector(value: Sequence[float], dimension: int | None = None) -> list[float]:
+    expected = dimension if dimension is not None else len(value)
+    result = _vector(value, expected, label="vector")
+    norm = float(np.linalg.norm(result))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise ValueError("vector must have a finite, non-zero L2 norm")
+    return (result / norm).tolist()
+
+
+def vector_delta(
+    latent_user_vector: Sequence[float], repository_vector: Sequence[float], alpha: float
+) -> list[float]:
+    """Implement alpha * (repository - user)."""
+    if not math.isfinite(alpha):
+        raise ValueError("alpha must be finite")
+    dimension = len(latent_user_vector)
+    user = _vector(latent_user_vector, dimension, label="latent user vector")
+    repository = _vector(repository_vector, dimension, label="repository vector")
+    return (alpha * (repository - user)).tolist()
+
+
+def shift_vector(
+    user_vec: Sequence[float], repo_vec: Sequence[float], alpha: float
+) -> list[float]:
+    delta = np.asarray(vector_delta(user_vec, repo_vec, alpha), dtype=np.float64)
+    return normalize_vector(np.asarray(user_vec, dtype=np.float64) + delta)
+
+
+def _point_vector(
+    point: Any, configured_name: str | None, *, label: str
+) -> tuple[list[float], str | None]:
+    value = point.vector
+    if isinstance(value, Mapping):
+        if configured_name:
+            if configured_name not in value:
+                raise ValueError(f"{label} does not contain named vector {configured_name!r}")
+            return list(value[configured_name]), configured_name
+        if len(value) != 1:
+            raise ValueError(f"{label} has ambiguous named vectors; configure the vector name")
+        name, vector = next(iter(value.items()))
+        return list(vector), str(name)
+    return list(value), None
 
 
 class FeedbackHandler:
+    """Apply one idempotent feedback event to an existing Qdrant user point.
+
+    The point payload owns the unnormalized latent vector, reversible deltas,
+    and a bounded replay guard. The consumer serializes updates per user.
+    """
+
     def __init__(
         self,
-        db_connector: PostgreSQLConnector | None = None,
+        qdrant_client: QdrantClient | None = None,
+        settings: FeedbackSettings | None = None,
+        *,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
     ) -> None:
-        self.db = db_connector or PostgreSQLConnector()
-        self.store = FeedbackStore(self.db)
-        self.qdrant_url = qdrant_url or QDRANT_URL
-        self.qdrant_api_key = qdrant_api_key or QDRANT_API_KEY
+        self.settings = settings or FeedbackSettings.from_env()
+        self.qdrant = qdrant_client or QdrantClient(
+            url=qdrant_url or self.settings.qdrant_url,
+            api_key=qdrant_api_key or self.settings.qdrant_api_key,
+            timeout=30.0,
+        )
 
-        self._qdrant_client: QdrantClient | None = None
-        self.redis_client = None
-        redis_url = os.getenv("REDIS_URL")
-        if redis_url:
-            try:
-                import redis
-                self.redis_client = redis.from_url(redis_url, decode_responses=True)
-            except Exception as exc:
-                logger.warning("Redis cache invalidation is unavailable: %s", exc)
-        if self.qdrant_url:
-            try:
-                self._qdrant_client = QdrantClient(
-                    url=self.qdrant_url,
-                    api_key=self.qdrant_api_key,
-                    timeout=30.0,
-                )
-            except Exception as exc:
-                logger.error("Failed to connect to Qdrant inside FeedbackHandler: %s", exc)
-
-    @property
-    def qdrant(self) -> QdrantClient | None:
-        return self._qdrant_client
+    def healthy(self) -> bool:
+        self.qdrant.get_collections()
+        return True
 
     def handle_feedback(
         self,
@@ -110,416 +135,157 @@ class FeedbackHandler:
         repo_id: str,
         action: str,
         *,
-        dwell_seconds: Optional[float] = None,
-        message_id: Optional[str] = None,
+        event_id: str | None = None,
+        dwell_seconds: float | None = None,
+        message_id: str | None = None,
     ) -> bool:
-        """Process a single feedback event: update Postgres counters and shift Qdrant embedding.
+        logical_id = event_id or message_id
+        if not logical_id:
+            raise ValueError("event_id is required for idempotent processing")
+        try:
+            return self._handle(
+                str(user_id), str(repo_id), normalize_interaction(action),
+                str(logical_id), dwell_seconds,
+            )
+        except ValueError:
+            raise
+        except Exception:
+            logger.exception("Feedback event %s failed", logical_id)
+            return False
 
-        Parameters
-        ----------
-        user_id       : Unique user identifier.
-        repo_id       : Repository full_name or UUID.
-        action        : One of the versioned feedback contract actions or dwell.
-        dwell_seconds : Required when action == 'dwell'. Observed time the user
-                        spent on the repository card, in seconds.
-        """
-        action = normalize_interaction(action)
-        interaction = None
-        if action != "dwell":
-            try:
-                interaction = get_interaction(action)
-            except ValueError:
-                logger.error("Unknown feedback action: %s", action)
-                return False
+    def _handle(
+        self,
+        user_id: str,
+        repo_id: str,
+        action: str,
+        event_id: str,
+        dwell_seconds: float | None,
+    ) -> bool:
+        definition = get_interaction(action)
+        user_id_qdrant = str(uuid.uuid5(uuid.NAMESPACE_URL, f"user:{user_id}"))
+        user_points = self.qdrant.retrieve(
+            collection_name=self.settings.user_collection,
+            ids=[user_id_qdrant],
+            with_payload=True,
+            with_vectors=True,
+        )
+        if not user_points:
+            logger.warning("User profile %s is not available yet", user_id)
+            return False
 
-        # Resolve the embedding learning rate (alpha) for this event.
+        point = user_points[0]
+        search_vector, vector_name = _point_vector(
+            point, self.settings.user_vector_name, label="user profile"
+        )
+        _vector(search_vector, self.settings.vector_dimension, label="user vector")
+        payload = copy.deepcopy(point.payload or {})
+        processed = [str(value) for value in payload.get(PROCESSED_KEY, [])]
+        if event_id in processed:
+            return True
+
+        latent = _vector(
+            payload.get(LATENT_KEY, search_vector),
+            self.settings.vector_dimension,
+            label="latent user vector",
+        )
+        adjustments: dict[str, Any] = copy.deepcopy(payload.get(ADJUSTMENTS_KEY, {}))
+        repo_state = adjustments.setdefault(repo_id, {})
+
         if action == "dwell":
             if dwell_seconds is None:
-                logger.warning(
-                    "'dwell' action received without dwell_seconds for user '%s'. Skipping.",
-                    user_id,
-                )
-                return False
-            resolved_alpha = _dwell_alpha(float(dwell_seconds))
-            if resolved_alpha is None:
-                # The below early return is for discarding sub-threshold dwells cleanly
-                # without touching Postgres or Qdrant — accidental scroll, not real interest.
-                logger.debug(
-                    "Dwell %.1fs below MIN_DWELL_SECONDS=%.1fs for user '%s'. Ignored.",
-                    dwell_seconds, MIN_DWELL_SECONDS, user_id,
-                )
-                return True   # not an error — just a no-op
+                raise ValueError("dwell_seconds is required for dwell")
+            alpha = dwell_alpha(
+                dwell_seconds,
+                minimum_seconds=self.settings.dwell_min_seconds,
+                full_credit_seconds=self.settings.dwell_full_credit_seconds,
+                maximum_alpha=self.settings.dwell_max_alpha,
+            )
+            if alpha is None:
+                return True
         else:
-            resolved_alpha = 0.0
+            if dwell_seconds is not None:
+                raise ValueError("dwell_seconds is only valid for dwell")
+            alpha = definition.embedding_alpha
 
-        # 1. Update PostgreSQL engagement counts (dwell has no column — no-op)
-        db_success = True
-        state_changed = action == "dwell" and resolved_alpha != 0.0
-        
-        conn = self.db._get_connection() if (self.db and self.db.enabled) else None
-        
-        try:
-            if action != "dwell":
-                try:
-                    if not interaction.persists_feedback:
-                        resolved_alpha = interaction.embedding_alpha
-                        state_changed = resolved_alpha != 0.0
-                    elif interaction.clears_interaction_type:
-                        deleted = self.store.delete(
-                            user_id,
-                            repo_id,
-                            interaction_type=interaction.clears_interaction_type,
-                            conn=conn,
-                        )
-                        state_changed = deleted
-                        if deleted:
-                            cleared = get_interaction(interaction.clears_interaction_type)
-                            resolved_alpha = -cleared.embedding_alpha
-                    else:
-                        record = self.store.record(user_id, repo_id, action, interaction.feedback_score, conn=conn)
-                        state_changed = record is not None
-                        if state_changed:
-                            resolved_alpha = interaction.embedding_alpha
-                except Exception as exc:
-                    # Transient / unexpected failure (DB connection, timeout).
-                    # Re-raise so the consumer does NOT ack and can retry later.
-                    logger.error("Failed to persist feedback (retryable): %s", exc)
-                    raise
-
-            logger.info(
-                "Processing feedback: User '%s' -> Repo '%s' [%s] alpha=%.4f changed=%s",
-                user_id, repo_id, action, resolved_alpha, state_changed,
-            )
-            db_success = self.update_postgres_metrics(repo_id, action, conn=conn) and db_success
-            if not db_success:
-                logger.warning("Failed to update engagement metrics in Postgres for '%s'", repo_id)
-
-            # 2. Invalidate the cached feed batches for this user in PostgreSQL
-            # We do this before commit so a cache failure rolls back Postgres.
-            cache_success = True
-            if state_changed and resolved_alpha != 0.0:
-                cache_success = self.invalidate_user_feed_cache(user_id)
-                if not cache_success:
-                    logger.warning("Failed to invalidate feed cache for user '%s'", user_id)
-
-            # 3. Update Qdrant user embedding vector using the resolved alpha
-            # We do this BEFORE Postgres commit so we can compute the correct resolved_alpha.
-            qdrant_success = True
-            
-            # Idempotency check for retries
-            qdrant_applied_key = f"qdrant_applied:{message_id}" if message_id else None
-            qdrant_already_applied = False
-            if qdrant_applied_key and self.redis_client:
-                try:
-                    qdrant_already_applied = self.redis_client.exists(qdrant_applied_key)
-                except Exception as exc:
-                    # Marker Read Failure Replays Delta fix: Fail closed until the marker can be read.
-                    logger.error("Transient Redis error while reading replay marker. Failing closed.")
-                    return False
-                    
-            if state_changed and resolved_alpha != 0.0:
-                if cache_success and db_success:
-                    if qdrant_already_applied:
-                        # Qdrant was already updated in a previous attempt. Skip to prevent double shift!
-                        qdrant_success = True
-                        logger.info("Qdrant vector shift already applied for message %s. Skipping.", message_id)
-                    else:
-                        qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
-                        marker_written = False
-                        if qdrant_success and qdrant_applied_key and self.redis_client:
-                            try:
-                                # Mark as applied so retries don't double shift
-                                self.redis_client.set(qdrant_applied_key, "1", ex=86400 * 7)
-                                marker_written = True
-                            except Exception as exc:
-                                logger.error("Failed to write Qdrant replay marker to Redis: %s", exc)
-                        
-                        if qdrant_success and qdrant_applied_key and self.redis_client and not marker_written:
-                            # We failed to write the marker!
-                            # We CANNOT proceed to Postgres commit, because if Postgres fails, we can't protect the retry!
-                            logger.warning("Rolling back Qdrant vector shift because replay marker could not be written.")
-                            rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
-                            if not rollback_success:
-                                logger.critical("CRITICAL: Failed to rollback Qdrant after marker write failure!")
-                                if self.redis_client:
-                                    try:
-                                        import json
-                                        dlq_payload = json.dumps({
-                                            "user_id": user_id,
-                                            "repo_id": repo_id,
-                                            "compensating_alpha": -resolved_alpha,
-                                            "error": "marker write failed"
-                                        })
-                                        self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
-                                    except Exception:
-                                        pass
-                            
-                            if rollback_success:
-                                qdrant_success = False
-                            else:
-                                logger.warning("Proceeding to Postgres commit to durably save the shifted state.")
-
-                        if not qdrant_success:
-                            logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
-                else:
-                    qdrant_success = False
-
-            if conn:
-                if db_success and qdrant_success and cache_success:
-                    try:
-                        conn.commit()
-                    except Exception as exc:
-                        conn.rollback()
-                        # Postgres failed. We MUST rollback Qdrant to safely retry, UNLESS we have a marker!
-                        if state_changed and resolved_alpha != 0.0:
-                            has_marker = qdrant_already_applied or locals().get('marker_written', False)
-                            
-                            if has_marker:
-                                logger.warning("Postgres commit failed, but Qdrant vector shift is protected by marker. Skipping rollback.")
-                            else:
-                                logger.error("Postgres commit failed and no replay marker exists, attempting to rollback Qdrant vector shift...")
-                                rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
-                                        
-                                if not rollback_success:
-                                    logger.critical("CRITICAL: Failed to rollback Qdrant for user '%s'.", user_id)
-                                    if self.redis_client:
-                                        try:
-                                            import json
-                                            dlq_payload = json.dumps({
-                                                "user_id": user_id,
-                                                "repo_id": repo_id,
-                                                "compensating_alpha": -resolved_alpha,
-                                                "error": str(exc)
-                                            })
-                                            self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
-                                        except Exception:
-                                            pass
-                        return False
-                else:
-                    conn.rollback()
-
-            return db_success and qdrant_success and cache_success
-        except Exception:
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
-
-    def update_postgres_metrics(self, repo_id: str, action: str, conn=None) -> bool:
-        """Increment the metric count inside the Repo PostgreSQL table."""
-        if action == "dwell":
-            column = None
-        else:
-            try:
-                column = get_interaction(action).metric_column
-            except ValueError:
-                column = None
-        if column is None or not self.db.enabled:
-            # Neutral/implicit actions and dwell have no Postgres counter — treat as success
-            return True
-
-        # Guard against SQL injection via strict whitelist validation (defense-in-depth)
-        if column not in {"views_count", "likes_count", "saves_count"}:
-            logger.error("Forbidden database column update: '%s'", column)
-            return False
-
-        auto_commit = conn is None
-        try:
-            conn = conn or self.db.connect()
-            cursor = conn.cursor()
-
-            # Increment count defensively handling NULL values using COALESCE
-            query = f"""
-            UPDATE Repo
-            SET {column} = COALESCE({column}, 0) + 1,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE full_name = %s OR repo_id::text = %s;
-            """
-            cursor.execute(query, (repo_id, repo_id))
-            if auto_commit:
-                conn.commit()
-
-            logger.info("Successfully incremented %s count for repo '%s'", column, repo_id)
-            return True
-        except Exception as exc:
-            logger.error("Error updating metrics in Postgres for repo '%s': %s", repo_id, exc)
-            if conn and auto_commit:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
-
-    def _resolve_repo_full_name(self, repo_id: str) -> str:
-        """Resolve a Postgres UUID back to full_name. If already full_name, return it."""
-        if len(repo_id) != 36 or repo_id.count("-") != 4:
-            return repo_id
-        if not self.db or not self.db.enabled:
-            return repo_id
-        conn = None
-        try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
-            cursor.execute("SELECT full_name FROM repo WHERE repo_id::text = %s", (repo_id,))
-            row = cursor.fetchone()
-            if row:
-                conn.commit()
-                return row[0]
-            cursor.execute("SELECT full_name FROM trending_repositories WHERE repo_id::text = %s", (repo_id,))
-            row = cursor.fetchone()
-            if row:
-                conn.commit()
-                return row[0]
-            conn.commit()
-        except Exception as e:
-            logger.error("Error resolving repo full_name: %s", e)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-        return repo_id
-
-    def update_user_embedding(self, user_id: str, repo_id: str, alpha: float) -> bool:
-        """Shift the user's Qdrant embedding towards (or away from) a repository vector.
-
-        Parameters
-        ----------
-        user_id : Unique user identifier.
-        repo_id : Repository full_name or UUID.
-        alpha   : Signed learning rate. Positive shifts toward the repo; negative
-                  shifts away for explicit disinterest.
-        """
-        if not self.qdrant:
-            logger.warning("Qdrant client not configured; skipping vector shift.")
-            return False
-
-        actual_repo_id = self._resolve_repo_full_name(repo_id)
-        user_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"user:{user_id}"))
-        repo_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{actual_repo_id}"))
-
-        try:
-            # 1. Fetch user vector and payload
-            user_points = self.qdrant.retrieve(
-                collection_name=USER_PROFILES_COLLECTION,
-                ids=[user_uuid],
-                with_vectors=True,
-            )
-            if not user_points:
-                logger.warning("User '%s' profiles not found in collection '%s'", user_id, USER_PROFILES_COLLECTION)
-                return False
-
-            user_point = user_points[0]
-            user_payload = user_point.payload or {}
-
-            # Extract user vector
-            user_vector = None
-            vector_name = None
-            if isinstance(user_point.vector, dict):
-                if TARGET_VECTOR_NAME and TARGET_VECTOR_NAME in user_point.vector:
-                    vector_name = TARGET_VECTOR_NAME
-                    user_vector = list(user_point.vector[vector_name])
-                else:
-                    vectors = list(user_point.vector.values())
-                    if not vectors:
-                        logger.error("User '%s' has an empty named-vector dict in Qdrant.", user_id)
-                        return False
-                    vector_name = list(user_point.vector.keys())[0]
-                    user_vector = list(vectors[0])
-            else:
-                user_vector = list(user_point.vector)
-
-            # 2. Fetch repository vector
-            repo_points = self.qdrant.retrieve(
-                collection_name=QDRANT_COLLECTION_NAME,
-                ids=[repo_uuid],
-                with_vectors=True,
-            )
-            if not repo_points:
-                logger.warning("Repository '%s' not found in collection '%s'. Skipping embedding adjustment.", repo_id, QDRANT_COLLECTION_NAME)
-                return False
-
-            repo_point = repo_points[0]
-            
-            # Repository vectors are named 'repo_embedding'
-            repo_vector = None
-            if isinstance(repo_point.vector, dict):
-                repo_vector = list(repo_point.vector.get("repo_embedding", []))
-            else:
-                repo_vector = list(repo_point.vector)
-
-            if not repo_vector or len(repo_vector) != EMBEDDING_DIM:
-                logger.error("Repository '%s' embedding dimension mismatch or missing.", repo_id)
-                return False
-
-            # 3. Calculate shifted vector using unnormalized preference accumulator
-            accumulator = user_payload.get("preference_accumulator")
-            if not accumulator or len(accumulator) != EMBEDDING_DIM:
-                # Fallback to current vector if accumulator is missing
-                accumulator = user_vector
-
-            u_accum = np.array(accumulator, dtype=np.float32)
-            r = np.array(repo_vector, dtype=np.float32)
-            new_accum = u_accum + alpha * r
-            user_payload["preference_accumulator"] = new_accum.tolist()
-
-            norm = np.linalg.norm(new_accum)
-            if norm > 0:
-                updated_vector = (new_accum / norm).tolist()
-            else:
-                updated_vector = new_accum.tolist()
-
-            # 4. Save updated vector back to Qdrant, preserving metadata payload
-            final_vector = {vector_name: updated_vector} if vector_name is not None else updated_vector
-            self.qdrant.upsert(
-                collection_name=USER_PROFILES_COLLECTION,
-                points=[
-                    PointStruct(
-                        id=user_uuid,
-                        vector=final_vector,
-                        payload=user_payload,
+        changed = False
+        if definition.reversal_of:
+            family = definition.state_family or ""
+            stored = repo_state.get(family)
+            if stored and stored.get("action") == definition.reversal_of:
+                latent -= _vector(
+                    stored.get("delta", []), self.settings.vector_dimension,
+                    label="stored feedback adjustment",
+                )
+                repo_state.pop(family, None)
+                changed = True
+        elif definition.state_family:
+            family = definition.state_family
+            stored = repo_state.get(family)
+            if not stored or stored.get("action") != action:
+                if stored:
+                    latent -= _vector(
+                        stored.get("delta", []), self.settings.vector_dimension,
+                        label="stored feedback adjustment",
                     )
-                ]
+                repository = self._repository_vector(repo_id)
+                if repository is None:
+                    return False
+                delta = _vector(
+                    vector_delta(latent, repository, alpha),
+                    self.settings.vector_dimension,
+                    label="feedback delta",
+                )
+                latent += delta
+                repo_state[family] = {
+                    "action": action,
+                    "delta": delta.tolist(),
+                    "event_id": event_id,
+                }
+                changed = True
+        elif alpha != 0.0:
+            repository = self._repository_vector(repo_id)
+            if repository is None:
+                return False
+            latent += _vector(
+                vector_delta(latent, repository, alpha),
+                self.settings.vector_dimension,
+                label="feedback delta",
             )
+            changed = True
 
-            logger.info("Successfully adjusted and upserted user '%s' embedding vector in Qdrant.", user_id)
-            return True
-        except Exception as exc:
-            logger.error("Failed to update user vector in Qdrant: %s", exc)
-            return False
+        if not repo_state:
+            adjustments.pop(repo_id, None)
+        processed.append(event_id)
+        payload[LATENT_KEY] = latent.tolist()
+        payload[ADJUSTMENTS_KEY] = adjustments
+        payload[PROCESSED_KEY] = processed[-self.settings.processed_event_history :]
+        normalized = normalize_vector(latent, self.settings.vector_dimension)
+        final_vector: Any = {vector_name: normalized} if vector_name else normalized
+        self.qdrant.upsert(
+            collection_name=self.settings.user_collection,
+            points=[PointStruct(id=point.id, vector=final_vector, payload=payload)],
+            wait=True,
+        )
+        logger.info(
+            "Applied feedback event %s action=%s user=%s changed=%s",
+            event_id, action, user_id, changed,
+        )
+        return True
 
-    def invalidate_user_feed_cache(self, user_id: str) -> bool:
-        """Invalidate persisted batches and the backend Redis delivery queue."""
-        redis_success = True
-        if self.redis_client:
-            try:
-                self.redis_client.delete(f"user:{user_id}:delivery_queue")
-            except Exception as exc:
-                logger.error("Failed to invalidate Redis feed for '%s': %s", user_id, exc)
-                redis_success = False
-
-        if not self.db.enabled:
-            return redis_success
-
-        conn = None
-        try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
-
-            # Delete cache row for user
-            query = "DELETE FROM user_recommendation_batches WHERE user_id = %s;"
-            cursor.execute(query, (user_id,))
-            conn.commit()
-
-            logger.info("Invalidated recommendation cache for user '%s'", user_id)
-            return redis_success
-        except Exception as exc:
-            logger.error("Failed to delete cache in PostgreSQL for user '%s': %s", user_id, exc)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
+    def _repository_vector(self, repo_id: str) -> list[float] | None:
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_id}"))
+        points = self.qdrant.retrieve(
+            collection_name=self.settings.repository_collection,
+            ids=[point_id],
+            with_payload=False,
+            with_vectors=True,
+        )
+        if not points:
+            logger.warning("Repository vector %s is not available", repo_id)
+            return None
+        vector, _ = _point_vector(
+            points[0], self.settings.repository_vector_name, label="repository"
+        )
+        return _vector(
+            vector, self.settings.vector_dimension, label="repository vector"
+        ).tolist()

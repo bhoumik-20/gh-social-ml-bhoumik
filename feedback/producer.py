@@ -1,33 +1,69 @@
-import os
-import logging
+"""Bounded Redis Stream publisher for feedback events."""
+
+from __future__ import annotations
+
 import asyncio
-from typing import Any, Dict, Optional
+import logging
+from typing import Any
+
+from .events import FeedbackEvent
+from .settings import FeedbackSettings
 
 logger = logging.getLogger("pipeline.feedback.producer")
-
-# Global in-memory queue fallback for non-Redis environments
-_in_memory_queue: asyncio.Queue = asyncio.Queue()
+_in_memory_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
 
 
-def get_in_memory_queue() -> asyncio.Queue:
+def get_in_memory_queue() -> asyncio.Queue[dict[str, str]]:
     return _in_memory_queue
 
 
-class FeedbackProducer:
-    def __init__(self, redis_url: str | None = None) -> None:
-        self.redis_url = redis_url or os.getenv("REDIS_URL")
-        self.redis_client = None
+def create_redis_client(settings: FeedbackSettings) -> Any:
+    if not settings.redis_url:
+        return None
+    try:
+        import redis
+    except ImportError as exc:
+        raise RuntimeError("redis is required by the production feedback API") from exc
+    return redis.from_url(settings.redis_url, decode_responses=True)
 
-        if self.redis_url:
-            try:
-                import redis
-                self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
-                # Test connection
-                self.redis_client.ping()
-                logger.info("Connected to Redis at %s for feedback streaming", self.redis_url)
-            except Exception as exc:
-                logger.warning("Redis connection failed: %s. Falling back to In-Memory Queue.", exc)
-                self.redis_client = None
+
+class FeedbackProducer:
+    def __init__(
+        self,
+        redis_client: Any | None = None,
+        settings: FeedbackSettings | None = None,
+        *,
+        queue: asyncio.Queue[dict[str, str]] | None = None,
+    ) -> None:
+        self.settings = settings or FeedbackSettings.from_env()
+        self.redis_client = redis_client if redis_client is not None else create_redis_client(self.settings)
+        self.queue = queue or _in_memory_queue
+
+    async def start(self) -> None:
+        if self.redis_client is not None:
+            await asyncio.to_thread(self.redis_client.ping)
+            return
+        if self.settings.production or not self.settings.allow_memory_fallback:
+            raise RuntimeError("Redis is required; no REDIS_URL was configured")
+        logger.warning("Explicit development-only in-memory feedback queue is enabled")
+
+    async def submit(self, event: FeedbackEvent) -> bool:
+        if not event or event.action == "impression":
+            return True
+        fields = event.as_redis_fields()
+        if self.redis_client is not None:
+            await asyncio.to_thread(
+                self.redis_client.xadd,
+                self.settings.stream_name,
+                fields,
+                maxlen=self.settings.stream_maxlen,
+                approximate=True,
+            )
+            return True
+        if self.settings.production or not self.settings.allow_memory_fallback:
+            raise RuntimeError("Redis is unavailable and memory fallback is disabled")
+        await self.queue.put(fields)
+        return True
 
     async def submit_feedback(
         self,
@@ -35,37 +71,19 @@ class FeedbackProducer:
         repo_id: str,
         action: str,
         *,
-        dwell_seconds: Optional[float] = None,
+        event_id: str,
+        occurred_at: str,
+        schema_version: int = 1,
+        dwell_seconds: float | None = None,
     ) -> bool:
-        """Submit a feedback event to the processing queue.
-
-        Pushes to Redis Stream if available, otherwise falls back to the
-        in-memory queue.  ``dwell_seconds`` is included in the event payload
-        when non-None so the consumer can resolve the embedding alpha.
-        """
-        event: Dict[str, Any] = {
-            "user_id": user_id,
-            "repo_id": repo_id,
-            "action": action,
-        }
-        # The below conditional is for keeping the event compact — only
-        # dwell events carry this field; all other actions leave it absent.
-        if dwell_seconds is not None:
-            event["dwell_seconds"] = dwell_seconds
-
-        if self.redis_client:
-            try:
-                # Redis Stream values must all be strings
-                redis_event = {k: str(v) for k, v in event.items()}
-                self.redis_client.xadd("feedback_stream", redis_event)
-                logger.info("Published event to Redis Stream: %s", event)
-                return True
-            except Exception as exc:
-                logger.error(
-                    "Failed to publish to Redis Stream: %s. Falling back to In-Memory Queue.", exc
-                )
-
-        # Fallback to in-memory queue
-        await _in_memory_queue.put(event)
-        logger.info("Enqueued event to In-Memory Queue: %s", event)
-        return True
+        return await self.submit(
+            FeedbackEvent(
+                event_id=event_id,
+                user_id=user_id,
+                repo_id=repo_id,
+                action=action,
+                occurred_at=occurred_at,
+                schema_version=schema_version,
+                dwell_seconds=dwell_seconds,
+            )
+        )

@@ -1,11 +1,18 @@
-import os
-import logging
-import asyncio
-import socket
-from typing import Dict, Any
+"""Reliable Redis Streams consumer for online feedback."""
 
-from .producer import get_in_memory_queue
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import socket
+import time
+from typing import Any, Iterable
+
 from .event_handlers import FeedbackHandler
+from .events import FeedbackEvent
+from .producer import create_redis_client, get_in_memory_queue
+from .settings import FeedbackSettings
 
 logger = logging.getLogger("pipeline.feedback.consumer")
 
@@ -14,250 +21,214 @@ class FeedbackConsumer:
     def __init__(
         self,
         handler: FeedbackHandler | None = None,
-        redis_url: str | None = None,
+        redis_client: Any | None = None,
+        settings: FeedbackSettings | None = None,
     ) -> None:
-        self.handler = handler or FeedbackHandler()
-        self.redis_url = redis_url or os.getenv("REDIS_URL")
-        self.redis_client = None
+        self.settings = settings or FeedbackSettings.from_env()
+        self.handler = handler or FeedbackHandler(settings=self.settings)
+        self.redis_client = (
+            redis_client if redis_client is not None else create_redis_client(self.settings)
+        )
+        self.consumer_name = (
+            f"{self.settings.consumer_name_prefix}-{socket.gethostname()}-{os.getpid()}"
+        )
         self.running = False
-        self.task: asyncio.Task | None = None
+        self.task: asyncio.Task[None] | None = None
+        self._memory_locks: dict[str, asyncio.Lock] = {}
 
-        if self.redis_url:
-            try:
-                import redis
-                self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
-                self.redis_client.ping()
-                logger.info("Connected to Redis for consuming feedback stream")
-            except Exception:
-                self.redis_client = None
+    @property
+    def healthy(self) -> bool:
+        return bool(self.running and self.task and not self.task.done())
 
     async def start(self) -> None:
-        """Start the consumer loop in the background."""
+        if self.task and not self.task.done():
+            return
+        if self.redis_client is None:
+            if self.settings.production or not self.settings.allow_memory_fallback:
+                raise RuntimeError("Redis is required for the feedback consumer")
+            self.running = True
+            self.task = asyncio.create_task(self._memory_loop(), name="feedback-memory-consumer")
+            return
+        await asyncio.to_thread(self.redis_client.ping)
+        await self._ensure_group()
         self.running = True
-        logger.info("Starting Feedback Consumer worker...")
+        self.task = asyncio.create_task(self._redis_loop(), name="feedback-redis-consumer")
 
-        if self.redis_client:
-            # Run Redis consumer loop
-            self.task = asyncio.create_task(self._redis_consume_loop())
-        else:
-            # Run in-memory consumer loop
-            self.task = asyncio.create_task(self._in_memory_consume_loop())
-
-    def stop(self) -> None:
-        """Stop the consumer loop."""
+    async def stop(self) -> None:
         self.running = False
         if self.task:
             self.task.cancel()
-
-    async def _in_memory_consume_loop(self) -> None:
-        queue = get_in_memory_queue()
-        logger.info("Feedback Consumer running in In-Memory Queue mode.")
-
-        while self.running:
             try:
-                # Wait for an event
-                event = await queue.get()
-                user_id = event.get("user_id")
-                repo_id = event.get("repo_id")
-                action = event.get("action")
-                # The below extraction is for passing observed dwell time to
-                # the handler so it can compute the embedding alpha correctly.
-                dwell_seconds_raw = event.get("dwell_seconds")
-                dwell_seconds = float(dwell_seconds_raw) if dwell_seconds_raw is not None else None
-
-                # Generate a stable message_id if one doesn't exist, so local retries
-                # can still benefit from replay guards if Redis becomes available.
-                if "message_id" not in event:
-                    import uuid
-                    event["message_id"] = f"local-{uuid.uuid4().hex}"
-                
-                message_id = event["message_id"]
-
-                if not user_id or not repo_id or not action:
-                    queue.task_done()
-                    continue
-
-                # Process feedback in a background thread to prevent blocking the asyncio event loop
-                success = False
-                try:
-                    loop = asyncio.get_running_loop()
-                    success = await loop.run_in_executor(
-                        None,
-                        lambda: self.handler.handle_feedback(
-                            user_id, repo_id, action, dwell_seconds=dwell_seconds, message_id=message_id
-                        )
-                    )
-                except Exception as exc:
-                    logger.error("Exception occurred while handling feedback: %s", exc)
-                if not success:
-                    # Retry in-memory events indefinitely with exponential backoff 
-                    # in a background task so we don't starve the queue.
-                    retries = event.get("retries", 0) + 1
-                    event["retries"] = retries
-                    logger.warning("Local queue event failed. Re-queueing. Attempt %d", retries)
-                    
-                    async def delayed_requeue(evt, r):
-                        delay = min(60, 2 ** r)
-                        await asyncio.sleep(delay)
-                        await queue.put(evt)
-                        
-                    asyncio.create_task(delayed_requeue(event, retries))
-                
-                queue.task_done()
-
+                await self.task
             except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error("Error in in-memory consume loop: %s", exc)
-                await asyncio.sleep(1)
+                pass
+            self.task = None
 
-    async def _redis_consume_loop(self) -> None:
-        logger.info("Feedback Consumer running in Redis Streams mode.")
-        stream_name = "feedback_stream"
-        group_name = "feedback_group"
-        # Dynamic consumer name to allow safe horizontal scaling
-        consumer_name = f"worker_{socket.gethostname()}_{os.getpid()}"
-
-        # Setup consumer group
+    async def _ensure_group(self) -> None:
         try:
-            self.redis_client.xgroup_create(stream_name, group_name, id="0", mkstream=True)
+            await asyncio.to_thread(
+                self.redis_client.xgroup_create,
+                self.settings.stream_name,
+                self.settings.consumer_group,
+                id="0",
+                mkstream=True,
+            )
         except Exception as exc:
-            # Group might already exist (BUSYGROUP)
             if "BUSYGROUP" not in str(exc):
-                logger.error("Failed to create Redis Stream group: %s. Falling back to In-Memory.", exc)
-                self.task = asyncio.create_task(self._in_memory_consume_loop())
-                return
+                raise RuntimeError("failed to create feedback consumer group") from exc
 
+    async def _memory_loop(self) -> None:
+        queue = get_in_memory_queue()
         while self.running:
             try:
-                # Read from group
-                # Since redis-py blocking commands block the event loop, we run in executor
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: self.redis_client.xreadgroup(
-                        group_name,
-                        consumer_name,
-                        {stream_name: ">"},
-                        count=1,
-                        block=1000,
-                    ),
-                )
-
-                if not response:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                for stream, messages in response:
-                    for message_id, payload in messages:
-                        user_id = payload.get("user_id")
-                        repo_id = payload.get("repo_id")
-                        action = payload.get("action")
-                        # Redis Stream values are strings — parse dwell_seconds back to float.
-                        dwell_seconds_raw = payload.get("dwell_seconds")
-                        try:
-                            dwell_seconds = float(dwell_seconds_raw) if dwell_seconds_raw is not None else None
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Could not parse dwell_seconds '%s' for message %s. Treating as None.",
-                                dwell_seconds_raw, message_id,
-                            )
-                            dwell_seconds = None
-
-                        if user_id and repo_id and action:
-                            processed_key = f"feedback:processed:{message_id}"
-                            
-                            # Check if already processed (using Redis exists check) to prevent dual processing
-                            already_processed = False
-                            try:
-                                already_processed = await loop.run_in_executor(
-                                    None,
-                                    self.redis_client.exists,
-                                    processed_key
-                                )
-                            except Exception as check_exc:
-                                logger.warning("Failed to check processed status in Redis: %s", check_exc)
-                            
-                            if already_processed:
-                                logger.info(
-                                    "Message %s was already processed successfully. Skipping processing and retrying ack.",
-                                    message_id
-                                )
-                                processed_success = True
-                            else:
-                                processed_success = False
-                                try:
-                                    # Execute vector updates and metric increments
-                                    processed_success = await loop.run_in_executor(
-                                        None,
-                                        lambda: self.handler.handle_feedback(
-                                            user_id, repo_id, action,
-                                            dwell_seconds=dwell_seconds,
-                                            message_id=message_id,
-                                        ),
-                                    )
-                                    
-                                    if processed_success:
-                                        # Mark as processed in Redis (expires in 24 hours)
-                                        try:
-                                            await loop.run_in_executor(
-                                                None,
-                                                lambda: self.redis_client.set(processed_key, "1", ex=86400)
-                                            )
-                                        except Exception as set_exc:
-                                            logger.warning("Failed to mark message %s as processed in Redis: %s", message_id, set_exc)
-                                except Exception as exc:
-                                    logger.error("Exception handling Redis Stream feedback: %s", exc)
-
-                            if processed_success:
-                                # Acknowledge message with retries on failure to handle transient connection issues
-                                ack_success = False
-                                for attempt in range(3):
-                                    try:
-                                        await loop.run_in_executor(
-                                            None,
-                                            self.redis_client.xack,
-                                            stream_name,
-                                            group_name,
-                                            message_id,
-                                        )
-                                        ack_success = True
-                                        break
-                                    except Exception as ack_exc:
-                                        logger.warning(
-                                            "Attempt %d failed to acknowledge message %s: %s. Retrying...",
-                                            attempt + 1,
-                                            message_id,
-                                            ack_exc,
-                                        )
-                                        await asyncio.sleep(2 ** attempt)
-
-                                if not ack_success:
-                                    logger.error(
-                                        "Failed to acknowledge successfully processed message %s after 3 attempts. "
-                                        "Message remains in PEL and may be re-processed.",
-                                        message_id,
-                                    )
-                        else:
-                            logger.error(
-                                "Skipping malformed message (missing user_id, repo_id, or action): ID %s, payload %s",
-                                message_id,
-                                payload,
-                            )
-                            try:
-                                # Acknowledge to remove it from PEL and prevent infinite redelivery
-                                await loop.run_in_executor(
-                                    None,
-                                    self.redis_client.xack,
-                                    stream_name,
-                                    group_name,
-                                    message_id,
-                                )
-                            except Exception as exc:
-                                logger.error("Failed to acknowledge malformed message: %s", exc)
-
+                payload = await queue.get()
+                try:
+                    event = FeedbackEvent.from_mapping(payload)
+                    lock = self._memory_locks.setdefault(event.user_id, asyncio.Lock())
+                    async with lock:
+                        success = await asyncio.to_thread(self._call_handler, event)
+                    if not success:
+                        await queue.put(payload)
+                        await asyncio.sleep(0.1)
+                finally:
+                    queue.task_done()
             except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error("Error in Redis stream consume loop: %s", exc)
-                await asyncio.sleep(1)
+                raise
+            except Exception:
+                logger.exception("Development feedback consumer failed")
+                await asyncio.sleep(0.25)
+
+    async def _redis_loop(self) -> None:
+        last_reclaim = 0.0
+        while self.running:
+            try:
+                now = time.monotonic()
+                if now - last_reclaim >= self.settings.reclaim_interval_seconds:
+                    for message_id, payload in await self._reclaim_stale():
+                        await self._process_message(message_id, payload)
+                    last_reclaim = now
+
+                response = await asyncio.to_thread(
+                    self.redis_client.xreadgroup,
+                    self.settings.consumer_group,
+                    self.consumer_name,
+                    {self.settings.stream_name: ">"},
+                    count=self.settings.read_batch_size,
+                    block=self.settings.read_block_ms,
+                )
+                for _stream, messages in response or []:
+                    for message_id, payload in messages:
+                        await self._process_message(str(message_id), payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Redis feedback consumer loop failed")
+                await asyncio.sleep(1.0)
+
+    async def _reclaim_stale(self) -> list[tuple[str, dict[str, str]]]:
+        try:
+            response = await asyncio.to_thread(
+                self.redis_client.xautoclaim,
+                self.settings.stream_name,
+                self.settings.consumer_group,
+                self.consumer_name,
+                self.settings.reclaim_idle_ms,
+                "0-0",
+                count=self.settings.read_batch_size,
+            )
+        except (AttributeError, TypeError):
+            logger.warning("Redis client does not support XAUTOCLAIM; pending reclaim is disabled")
+            return []
+        if not response:
+            return []
+        messages: Iterable[Any] = response[1] if len(response) > 1 else []
+        return [(str(message_id), payload) for message_id, payload in messages]
+
+    async def _process_message(self, message_id: str, payload: dict[str, str]) -> None:
+        try:
+            event = FeedbackEvent.from_mapping(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            await self._dead_letter(message_id, payload, f"invalid event: {exc}")
+            await self._ack(message_id)
+            return
+
+        processed_key = f"feedback:processed:{event.event_id}"
+        if await asyncio.to_thread(self.redis_client.exists, processed_key):
+            await self._ack(message_id)
+            return
+
+        lock = self.redis_client.lock(
+            f"feedback:user-lock:{event.user_id}",
+            timeout=self.settings.user_lock_ttl_seconds,
+            blocking_timeout=self.settings.user_lock_wait_seconds,
+        )
+        acquired = await asyncio.to_thread(lock.acquire)
+        if not acquired:
+            return
+        try:
+            if await asyncio.to_thread(self.redis_client.exists, processed_key):
+                await self._ack(message_id)
+                return
+            try:
+                success = await asyncio.to_thread(self._call_handler, event)
+            except ValueError as exc:
+                await self._dead_letter(message_id, payload, f"non-retryable event: {exc}")
+                await self._ack(message_id)
+                return
+            if not success:
+                await self._record_failure(message_id, payload, event.event_id)
+                return
+            await asyncio.to_thread(
+                self.redis_client.set,
+                processed_key,
+                "1",
+                ex=self.settings.idempotency_ttl_seconds,
+            )
+            await self._ack(message_id)
+        finally:
+            try:
+                await asyncio.to_thread(lock.release)
+            except Exception:
+                logger.warning("Feedback user lock expired before release for %s", event.user_id)
+
+    def _call_handler(self, event: FeedbackEvent) -> bool:
+        return self.handler.handle_feedback(
+            event.user_id,
+            event.repo_id,
+            event.action,
+            event_id=event.event_id,
+            dwell_seconds=event.dwell_seconds,
+        )
+
+    async def _record_failure(
+        self, message_id: str, payload: dict[str, str], event_id: str
+    ) -> None:
+        attempts_key = f"feedback:attempts:{event_id}"
+        attempts = await asyncio.to_thread(self.redis_client.incr, attempts_key)
+        await asyncio.to_thread(
+            self.redis_client.expire, attempts_key, self.settings.idempotency_ttl_seconds
+        )
+        if int(attempts) >= self.settings.max_delivery_attempts:
+            await self._dead_letter(message_id, payload, "retry limit exceeded")
+            await self._ack(message_id)
+
+    async def _dead_letter(
+        self, message_id: str, payload: dict[str, str], reason: str
+    ) -> None:
+        dead = dict(payload)
+        dead.update({"source_message_id": message_id, "failure_reason": reason[:500]})
+        await asyncio.to_thread(
+            self.redis_client.xadd,
+            self.settings.dead_letter_stream,
+            dead,
+            maxlen=self.settings.stream_maxlen,
+            approximate=True,
+        )
+
+    async def _ack(self, message_id: str) -> None:
+        await asyncio.to_thread(
+            self.redis_client.xack,
+            self.settings.stream_name,
+            self.settings.consumer_group,
+            message_id,
+        )
