@@ -107,7 +107,8 @@ class QdrantV2Retriever:
         stars = max(0, int(payload.get("star_count") or 0))
         velocity = max(0.0, float(payload.get("trend_velocity") or payload.get("delta_7d") or 0))
         activity = max(0.0, float(payload.get("activity_score") or 0))
-        pushed_days = max(0, int(payload.get("pushed_days_ago") or 999))
+        raw_pushed_days = payload.get("pushed_days_ago")
+        pushed_days = 999 if raw_pushed_days is None else max(0, int(raw_pushed_days))
         freshness = math.exp(-pushed_days / 60)
         score = 0.35 * math.log1p(stars) + 0.35 * math.log1p(velocity) + 0.2 * activity + 0.1 * freshness
         source = "trending" if velocity > 0 else "fresh" if pushed_days <= 30 else "popular"
