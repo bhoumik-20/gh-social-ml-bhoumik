@@ -6,13 +6,13 @@ ingestion engine. It supports both scheduled (daemon) mode and one-time executio
 
 Usage:
     # Run as a scheduled service (refreshes every 24 hours)
-    python trending_service.py --scheduled
+    uv run python trending_service.py --scheduled
 
     # Run a single refresh cycle
-    python trending_service.py --once
+    uv run python trending_service.py --once
 
     # Run with custom configuration
-    python trending_service.py --once --limit 50 --refresh-hours 12
+    uv run python trending_service.py --once --limit 50 --refresh-hours 12
 """
 
 import argparse

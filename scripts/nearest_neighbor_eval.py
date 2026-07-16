@@ -481,10 +481,10 @@ def format_report(
             "",
             "## Run instructions",
             "```powershell",
-            "python nearest_neighbor_eval.py",
-            "python nearest_neighbor_eval.py --limit 50 --top-k 5",
-            "python nearest_neighbor_eval.py --skip-comparison",
-            "python nearest_neighbor_eval.py --no-report",
+            "uv run python scripts/nearest_neighbor_eval.py",
+            "uv run python scripts/nearest_neighbor_eval.py --limit 50 --top-k 5",
+            "uv run python scripts/nearest_neighbor_eval.py --skip-comparison",
+            "uv run python scripts/nearest_neighbor_eval.py --no-report",
             "```",
         ]
     )

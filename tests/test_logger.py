@@ -8,6 +8,13 @@ import pytest
 from trending.logger import setup_logger, get_logger
 
 
+def close_handlers(logger: logging.Logger) -> None:
+    """Close logger-owned resources so temporary files can be removed on Windows."""
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+
+
 @pytest.mark.unit
 class TestSetupLogger:
     """Test setup_logger function."""
@@ -39,9 +46,7 @@ class TestSetupLogger:
             # Check that file handler was added
             assert any(isinstance(h, logging.FileHandler) for h in logger.handlers)
         finally:
-            for handler in logger.handlers[:]:
-                handler.close()
-                logger.removeHandler(handler)
+            close_handlers(logging.getLogger("test_logger_file"))
             os.unlink(log_file)
 
     def test_setup_logger_without_file_output(self):
@@ -159,7 +164,5 @@ class TestLoggerFunctionality:
                 content = f.read()
                 assert "Test message to file" in content
         finally:
-            for handler in logger.handlers[:]:
-                handler.close()
-                logger.removeHandler(handler)
+            close_handlers(logging.getLogger("test_file_output"))
             os.unlink(log_file)

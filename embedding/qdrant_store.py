@@ -49,7 +49,7 @@ class QdrantRepositoryStore:
         except ImportError as exc:
             raise RuntimeError(
                 "qdrant-client is required for vector storage. "
-                "Install dependencies from requirements.txt."
+                "Run 'uv sync' to install project dependencies."
             ) from exc
 
         self.models = models

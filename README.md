@@ -31,15 +31,10 @@ The first SentenceTransformer run downloads the configured model and may take lo
 git clone https://github.com/SUBHRO71/gh-social-ml.git
 cd gh-social-ml
 
-python -m venv .venv
-# PowerShell
-.venv\Scripts\Activate.ps1
-# macOS/Linux
-# source .venv/bin/activate
-
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+# Install uv first: https://docs.astral.sh/uv/getting-started/installation/
+uv sync --locked
 cp .env.example .env
+uv run python main.py --validate-config
 ```
 
 On PowerShell, use `Copy-Item .env.example .env` instead of `cp` if `cp` is not available.
