@@ -15,7 +15,7 @@ Flow:
   8. Display rich output
 
 Usage:
-    python3 scripts/e2e_mini_pipeline_test.py
+    uv run python scripts/e2e_mini_pipeline_test.py
 """
 
 # Ensure the project root is on the path regardless of where we run from

@@ -90,7 +90,7 @@ class PostgreSQLConnector:
         if not HAS_PG8000:
             logger.warning(
                 "DATABASE_URL is set but pg8000 is not installed. Database integration will be disabled. "
-                "Run 'pip install pg8000' to enable database storage."
+                "Run 'uv sync' to install the database storage dependency."
             )
             self.enabled = False
             return

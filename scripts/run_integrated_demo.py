@@ -8,16 +8,16 @@ Demonstrates the full end-to-end recommendation pipeline:
 Usage::
 
     # Run for all onboarded users
-    python3 scripts/run_integrated_demo.py
+    uv run python scripts/run_integrated_demo.py
 
     # Run for a specific user
-    python3 scripts/run_integrated_demo.py --user-id alice_ml_expert
+    uv run python scripts/run_integrated_demo.py --user-id alice_ml_expert
 
     # Onboard mock users first, then run
-    python3 scripts/run_integrated_demo.py --onboard-first
+    uv run python scripts/run_integrated_demo.py --onboard-first
 
     # Force re-generate batches (bypass 24-hour cache)
-    python3 scripts/run_integrated_demo.py --no-cache
+    uv run python scripts/run_integrated_demo.py --no-cache
 """
 
 from __future__ import annotations

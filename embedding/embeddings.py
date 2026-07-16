@@ -46,7 +46,7 @@ class SentenceTransformerEmbedder:
             except ImportError as exc:
                 raise RuntimeError(
                     "sentence-transformers is required for repository embeddings. "
-                    "Install dependencies from requirements.txt."
+                    "Run 'uv sync' to install project dependencies."
                 ) from exc
             logger.info("Loading embedding model: %s", self.model_name)
             self._model = SentenceTransformer(self.model_name)

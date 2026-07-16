@@ -115,7 +115,7 @@ class UserOnboardingPipeline:
             except ImportError as exc:
                 raise ImportError(
                     "sentence-transformers is required for user onboarding. "
-                    "Install dependencies from requirements.txt."
+                    "Run 'uv sync' to install project dependencies."
                 ) from exc
             self._model = SentenceTransformer(self.model_name)
             logger.info("Loaded onboarding embedding model: %s", self.model_name)

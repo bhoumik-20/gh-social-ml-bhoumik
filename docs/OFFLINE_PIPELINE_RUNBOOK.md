@@ -38,14 +38,14 @@ Trending uses the same backend credentials and enriches scraped repositories bef
 These commands validate parsing and required configuration without contacting GitHub, Postgres, Qdrant, or OpenRouter:
 
 ```bash
-python3 main.py --validate-config
-python3 trending_service.py --validate-config
+uv run python main.py --validate-config
+uv run python trending_service.py --validate-config
 ```
 
 If Qdrant is intentionally unavailable during a Postgres-only maintenance window:
 
 ```bash
-python3 main.py --validate-config --no-index-qdrant
+uv run python main.py --validate-config --no-index-qdrant
 ```
 
 Validation success does not prove that credentials are accepted or that a remote service is healthy. It proves the local worker configuration is internally valid.
@@ -55,7 +55,7 @@ Validation success does not prove that credentials are accepted or that a remote
 Run one bounded production cycle:
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --limit 150 \
   --batch-size 15 \
   --workers 4 \
@@ -90,13 +90,13 @@ Inspect the final `Corpus run report` log and the checkpoint's `last_run`, `fail
 Run one forced refresh and publish an atomic snapshot to the backend:
 
 ```bash
-python3 trending_service.py --once
+uv run python trending_service.py --once
 ```
 
 Run the long-lived scheduler:
 
 ```bash
-python3 trending_service.py --scheduled
+uv run python trending_service.py --scheduled
 ```
 
 The scheduler handles `SIGINT` and `SIGTERM`. A normal stop clears its in-process schedule and exits the loop.
@@ -120,7 +120,7 @@ The production path is `trending worker → backend snapshot API → backend out
 Run the deterministic suite:
 
 ```bash
-pytest -q
+uv run pytest -q
 ```
 
 Tests mock external services. A default test run must not contact GitHub, Postgres, Qdrant, or OpenRouter.

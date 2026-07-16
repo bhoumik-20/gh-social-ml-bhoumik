@@ -47,7 +47,7 @@ class TrendingScheduler:
         if not HAS_SCHEDULE:
             raise ImportError(
                 "schedule library is not installed. "
-                "Run 'pip install schedule' to enable scheduling."
+                "Run 'uv sync' to install the scheduling dependency."
             )
 
         self.fetcher = fetcher or TrendingFetcher()

@@ -49,11 +49,12 @@ Write a compelling overview about the project: the problem it solves, the motiva
 # 2) Create a branch
  git checkout -b feat/your-feature
 
-# 3) Install dependencies
-# paste your install command(s) here
+# 3) Install uv, then create the environment from the lockfile
+# https://docs.astral.sh/uv/getting-started/installation/
+ uv sync --locked
 
 # 4) Run the project
-# paste your run command(s) here
+ uv run python main.py --validate-config
 ```
 
 ---
