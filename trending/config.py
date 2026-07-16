@@ -22,12 +22,6 @@ TRENDING_REFRESH_HOURS: int = 24  # Default, will be validated and cast in valid
 TRENDING_TABLE_NAME: str = os.getenv("TRENDING_TABLE_NAME", "trending_repositories")
 TRENDING_METADATA_TABLE_NAME: str = os.getenv("TRENDING_METADATA_TABLE_NAME", "trending_metadata")
 
-# Payload synchronization is opt-in so the Postgres trending refresh can still
-# run in deployments that do not provide Qdrant to this offline service.
-TRENDING_QDRANT_SYNC_STR: str = os.getenv("TRENDING_QDRANT_SYNC_ENABLED", "false")
-TRENDING_QDRANT_SYNC_ENABLED: bool = False
-
-
 # ── GitHub API Configuration ───────────────────────────────────────────────────────
 
 # Request timeout in seconds (for HTTP requests to GitHub Trending page)
@@ -92,18 +86,8 @@ def validate_config() -> list[str]:
     """
     global TRENDING_REPO_LIMIT, TRENDING_REFRESH_HOURS, GITHUB_TIMEOUT_SECONDS
     global GITHUB_MAX_RETRIES, README_MAX_LENGTH, DB_POOL_SIZE, MAX_CONSECUTIVE_FAILURES
-    global TRENDING_QDRANT_SYNC_ENABLED
-    
-    errors: list[str] = []
 
-    normalized_sync = str(TRENDING_QDRANT_SYNC_STR).strip().lower()
-    if normalized_sync not in {"true", "false"}:
-        errors.append(
-            "TRENDING_QDRANT_SYNC_ENABLED must be 'true' or 'false', "
-            f"got {TRENDING_QDRANT_SYNC_STR!r}"
-        )
-    else:
-        TRENDING_QDRANT_SYNC_ENABLED = normalized_sync == "true"
+    errors: list[str] = []
 
     # Cast and validate TRENDING_REPO_LIMIT
     try:

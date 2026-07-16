@@ -1,8 +1,4 @@
-"""Scheduler for trending repository ingestion engine.
-
-This module manages the 8-hour refresh cycle for trending repositories using
-the schedule library.
-"""
+"""Schedule GitHub Trending collection and backend snapshot delivery."""
 
 from __future__ import annotations
 
@@ -44,8 +40,9 @@ class TrendingScheduler:
         Args:
             fetcher: Optional TrendingFetcher instance. If not provided,
                 a new fetcher will be created.
-            storage: Optional TrendingStorage instance. If not provided,
-                a new storage will be created.
+            storage: Delivery adapter. Production injects
+                ``BackendTrendingStorage``; the default PostgreSQL adapter is
+                retained only for legacy local compatibility.
         """
         if not HAS_SCHEDULE:
             raise ImportError(
@@ -77,12 +74,12 @@ class TrendingScheduler:
         self.stop()
 
     def refresh_trending_repositories(self, force: bool = False) -> bool:
-        """Fetch and store trending repositories.
+        """Fetch trending repositories and publish one complete snapshot.
 
         This is the main refresh operation that:
         1. Fetches trending repositories from GitHub
-        2. Stores them in the database
-        3. Updates metadata
+        2. Delivers them through the configured storage boundary
+        3. Records the successful refresh timestamp
 
         Returns:
             True if refresh succeeded, False otherwise.
@@ -118,7 +115,7 @@ class TrendingScheduler:
             if self.storage.enabled:
                 self.storage.init_schema()
             else:
-                logger.warning("Storage not enabled. Skipping database operations.")
+                logger.warning("Storage not enabled. Skipping snapshot delivery.")
                 return False
 
             # Fetch trending repositories
@@ -131,7 +128,7 @@ class TrendingScheduler:
 
             logger.info(f"Fetched {len(repositories)} repositories from GitHub.")
 
-            # Store repositories in database
+            # The production adapter publishes one atomic backend-v2 snapshot.
             refresh_timestamp = datetime.now(timezone.utc)
             upserted_count = self.storage.upsert_repositories(
                 repositories, refresh_timestamp
@@ -140,11 +137,15 @@ class TrendingScheduler:
             # Check if all repositories were successfully upserted
             if upserted_count != len(repositories):
                 logger.warning(
-                    f"Partial batch write: only {upserted_count}/{len(repositories)} repositories upserted to database."
+                    f"Partial snapshot delivery: only {upserted_count}/{len(repositories)} repositories accepted."
                 )
                 return False
 
-            logger.info(f"Successfully upserted {upserted_count} repositories to database.")
+            logger.info(
+                "Successfully published %d repositories through the configured "
+                "snapshot boundary.",
+                upserted_count,
+            )
 
             # Log summary
             last_refresh = self.storage.get_last_refresh_time()

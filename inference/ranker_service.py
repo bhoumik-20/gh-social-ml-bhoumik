@@ -2,7 +2,22 @@ import torch
 import torch.nn as nn
 import numpy as np
 import json
+import logging
 import os
+
+from inference.feature_spec import (
+    EMBEDDING_DIM,
+    FEATURE_COUNT,
+    FEATURE_ORDER,
+    FEATURE_SPEC_VERSION,
+    INPUT_DIM,
+    RANKER_MODEL_VERSION,
+)
+from inference.value_function import VALUE_WEIGHTS, compute_value_score
+from config import REPOSITORY_EMBEDDING_VERSION
+
+
+logger = logging.getLogger("pipeline.ranker")
 
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
@@ -68,20 +83,63 @@ def calculate_match_score(user_interests_skills, repo_languages, repo_topics, re
     return matches / len(user_interests_skills)
 
 class RankerService:
-    def __init__(self, model_path="heavy_ranker.pt", scaler_path="feature_scaler.json", emb_dim=384):
+    def __init__(
+        self,
+        model_path="heavy_ranker.pt",
+        scaler_path="feature_scaler.json",
+        emb_dim=384,
+        manifest_path=None,
+    ):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.emb_dim = emb_dim
+        self.emb_dim = EMBEDDING_DIM
+        self.model_version = RANKER_MODEL_VERSION
+        self.embedding_version = REPOSITORY_EMBEDDING_VERSION
+        self.feature_spec_version = FEATURE_SPEC_VERSION
         
         # Total input dim = User_emb(384) + Repo_emb(384) + DenseFeatures(10)
-        self.input_dim = (emb_dim * 2) + 10
+        self.input_dim = INPUT_DIM
+
+        if manifest_path is None:
+            manifest_path = os.path.join(
+                os.path.dirname(os.path.abspath(model_path)),
+                "model_manifest.json",
+            )
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            expected_contract = {
+                "input_dim": INPUT_DIM,
+                "embedding_dim": EMBEDDING_DIM,
+                "feature_count": FEATURE_COUNT,
+                "feature_spec_version": FEATURE_SPEC_VERSION,
+            }
+            mismatches = {
+                key: (manifest.get(key), expected)
+                for key, expected in expected_contract.items()
+                if manifest.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError(
+                    f"Model manifest is incompatible with inference: {mismatches}"
+                )
+            self.model_version = str(
+                manifest.get("model_version") or RANKER_MODEL_VERSION
+            )
+            self.embedding_version = str(
+                manifest.get("embedding_version")
+                or REPOSITORY_EMBEDDING_VERSION
+            )
+            logger.info("Model manifest loaded successfully from %s", manifest_path)
         
         # Load Model
         self.model = MMoEHeavyRanker(self.input_dim).to(self.device)
+        self._model_loaded = False
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
-            print("✅ Heavy Ranker Model loaded successfully.")
+            self._model_loaded = True
+            logger.info("Heavy Ranker model loaded successfully from %s", model_path)
         else:
-            print(f"⚠️ WARNING: {model_path} not found. Running with untrained weights for demo.")
+            logger.warning("Heavy Ranker model not found at %s", model_path)
         self.model.eval()
             
         # Load Scaler safely from JSON
@@ -90,14 +148,23 @@ class RankerService:
                 scaler_params = json.load(f)
             self.scaler_mean = np.array(scaler_params['mean'], dtype=np.float32)
             self.scaler_scale = np.array(scaler_params['scale'], dtype=np.float32)
-            print("✅ Feature Scaler JSON loaded successfully.")
+            if len(self.scaler_mean) != FEATURE_COUNT:
+                raise ValueError(
+                    f"Feature scaler has {len(self.scaler_mean)} features; "
+                    f"expected {FEATURE_COUNT}"
+                )
+            logger.info("Feature scaler loaded successfully from %s", scaler_path)
         else:
-            raise RuntimeError(f"❌ ERROR: {scaler_path} not found! Refusing to start with unscaled features which corrupt predictions.")
+            raise RuntimeError(f"{scaler_path} not found; refusing to use unscaled features")
 
     def score_batch(self, user_embedding, user_skills, candidate_repos):
         """
         Executes the MMoE network on a micro-batch (e.g. 15 or 150 repos).
         """
+        if not self._model_loaded:
+            logger.warning("Heavy Ranker model is not loaded; returning no scores")
+            return []
+
         if not candidate_repos:
             return []
             
@@ -112,18 +179,19 @@ class RankerService:
             
             # The EXACT 10 features generated in DataGen:
             # batch_doc, batch_health, batch_readme, batch_stars, batch_forks, batch_issues, batch_pushed, batch_activity, batch_trend, skill_match_score
-            row = [
-                repo.get('doc_quality', 0.5),
-                repo.get('code_health', 0.5),
-                repo.get('readme_length', 1000),
-                repo.get('star_count', 0),
-                repo.get('fork_count', 0),
-                repo.get('open_issues_count', 0),
-                repo.get('pushed_days_ago', 365),
-                repo.get('activity_score', 0.0),
-                repo.get('trend_velocity', 0.0),
-                skill_match
-            ]
+            feature_values = {
+                'doc_quality': repo.get('doc_quality', 0.5),
+                'code_health': repo.get('code_health', 0.5),
+                'readme_length': repo.get('readme_length', 1000),
+                'star_count': repo.get('star_count', 0),
+                'fork_count': repo.get('fork_count', 0),
+                'open_issues_count': repo.get('open_issues_count', 0),
+                'pushed_days_ago': repo.get('pushed_days_ago', 365),
+                'activity_score': repo.get('activity_score', 0.0),
+                'trend_velocity': repo.get('trend_velocity', 0.0),
+                'skill_match_score': skill_match,
+            }
+            row = [feature_values[name] for name in FEATURE_ORDER]
             dense_features.append(row)
             
         dense_features = np.array(dense_features)
@@ -150,101 +218,23 @@ class RankerService:
             p_dwell = p_dwell.cpu().numpy()
             p_fol = p_fol.cpu().numpy()
 
-        # 3. Apply The Value Function (Business Math)
-        # Weights: Clicks=1, Save=5, GH_Open=2, Dwell=0.1, Follow=20
-        final_scores = (1.0 * p_ctr) + (5.0 * p_save) + (2.0 * p_gh) + (0.1 * p_dwell) + (20.0 * p_fol)
-        
-        # 4. Attach scores and sort
+        # 3. Apply the value function and attach scores.
         results = []
         for i, repo in enumerate(candidate_repos):
+            predictions_dict = {
+                "p_ctr": float(p_ctr[i]),
+                "p_save": float(p_save[i]),
+                "p_gh": float(p_gh[i]),
+                "pred_dwell_fraction": float(p_dwell[i]),
+                "p_follow": float(p_fol[i]),
+            }
             results.append({
                 "repo_id": repo['id'],
-                "final_score": float(final_scores[i]),
+                "final_score": compute_value_score(predictions_dict),
                 "skill_match": float(unscaled_features[i][9]), # For debug
-                "predictions": {
-                    "p_ctr": float(p_ctr[i]),
-                    "p_save": float(p_save[i]),
-                    "p_gh": float(p_gh[i]),
-                    "pred_dwell_fraction": float(p_dwell[i]), # Multiply by 600 to get seconds
-                    "p_follow": float(p_fol[i])
-                }
+                "predictions": predictions_dict,
             })
             
         # Sort descending by score
         results = sorted(results, key=lambda x: x['final_score'], reverse=True)
         return results
-
-
-
-# ------------------------------ Demonstration of Micro-Batching Logic ----------------------------------------
-# !!!!!!!!!!!!----------------------------will be removed later-------------------------------!!!!!!!!!!!!!!
-
-if __name__ == "__main__":
-    print("\n--- Testing Ranker Service with Rich Metadata ---")
-    service = RankerService()
-    
-    # Fake user data
-    current_user_embedding = np.random.randn(384)
-    current_user_embedding /= np.linalg.norm(current_user_embedding)
-    user_skills = ["Python", "Machine Learning", "PyTorch", "AI/ML"]
-    
-    # Fake pool of 150 candidates from Qdrant
-    pool = []
-    for i in range(150):
-        # We simulate one really good Python repo
-        is_perfect = (i == 42)
-        pool.append({
-            'id': f'repo_{i}',
-            'embedding': np.random.randn(384) / np.linalg.norm(np.random.randn(384)),
-            'doc_quality': 0.9 if is_perfect else 0.4,
-            'code_health': 0.8 if is_perfect else 0.5,
-            'readme_length': 5000 if is_perfect else 800,
-            'star_count': 10000 if is_perfect else np.random.randint(10, 500),
-            'fork_count': 2000 if is_perfect else np.random.randint(0, 100),
-            'open_issues_count': 50 if is_perfect else np.random.randint(0, 20),
-            'pushed_days_ago': 1 if is_perfect else np.random.randint(30, 365),
-            'activity_score': 0.9 if is_perfect else 0.1,
-            'trend_velocity': 0.8 if is_perfect else 0.05,
-            'languages': ["Python"] if is_perfect else ["Java"],
-            'topics': ["Machine Learning", "AI"] if is_perfect else ["enterprise"],
-            'tags': ["PyTorch"] if is_perfect else ["spring-boot"]
-        })
-        
-    print(f"Candidate Pool Size: {len(pool)} repos from Qdrant")
-    
-    # ---------------------------------------------------------
-    # STEP 1: INITIAL TRUE RANKING (Score all 150)
-    # ---------------------------------------------------------
-    print("\nExecuting Heavy Ranker on ALL 150 candidates...")
-    ranked_pool = service.score_batch(current_user_embedding, user_skills, pool)
-    
-    # Serve Batch 1 (Top 15)
-    feed_batch_1 = ranked_pool[:15]
-    print("\n--- SERVING BATCH 1 (Top 15) ---")
-    for r in feed_batch_1[:3]: # Just printing top 3 for brevity
-        print(f"  {r['repo_id']} | Final Score: {r['final_score']:.2f} | Skill Match: {r['skill_match']:.2f}")
-        
-    # ---------------------------------------------------------
-    # STEP 2: REAL-TIME FEEDBACK
-    # ---------------------------------------------------------
-    print("\n[User interacts with Batch 1 -> Real-time Feedback Loop triggers]")
-    # User's embedding is updated slightly based on interaction
-    current_user_embedding += np.random.randn(384) * 0.1
-    current_user_embedding /= np.linalg.norm(current_user_embedding)
-    
-    # We remove the 15 repos we already showed them
-    seen_repo_ids = {r['repo_id'] for r in feed_batch_1}
-    remaining_pool = [r for r in pool if r['id'] not in seen_repo_ids]
-    
-    # ---------------------------------------------------------
-    # STEP 3: RE-RANKING (Score the remaining 135)
-    # ---------------------------------------------------------
-    print(f"\nRe-Executing Heavy Ranker on remaining {len(remaining_pool)} candidates...")
-    ranked_pool_2 = service.score_batch(current_user_embedding, user_skills, remaining_pool)
-    
-    # Serve Batch 2 (Next Top 15)
-    feed_batch_2 = ranked_pool_2[:15]
-    print("\n--- SERVING BATCH 2 (Top 15) ---")
-    for r in feed_batch_2[:3]:
-        print(f"  {r['repo_id']} | Final Score: {r['final_score']:.2f}")
-

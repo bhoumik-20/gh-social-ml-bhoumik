@@ -7,19 +7,21 @@ refreshes this list every 24 hours.
 Architecture:
 - fetcher: Fetches trending repositories from GitHub Trending page via HTML parsing
 - scheduler: Manages 24-hour refresh scheduling
-- storage: Handles PostgreSQL storage for trending repos
+- backend_storage: Publishes atomic snapshots to the backend; the backend outbox
+  and ML refresh pipeline own Qdrant propagation
+- storage: Legacy local PostgreSQL adapter retained for non-production compatibility
 - config: Trending-specific configuration
 - logger: Centralized logging setup
 """
 
 from .fetcher import TrendingFetcher
-from .storage import TrendingStorage
+from .backend_storage import BackendTrendingStorage
 from .scheduler import TrendingScheduler
 from . import config
 
 __all__ = [
     "TrendingFetcher",
-    "TrendingStorage",
+    "BackendTrendingStorage",
     "TrendingScheduler",
     "config",
 ]

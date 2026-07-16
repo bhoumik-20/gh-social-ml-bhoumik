@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 from types import SimpleNamespace
 import uuid
 
+import pytest
+
 from acquisition.backend_client import BackendIngestionClient, repository_upsert_record
 from trending.backend_storage import BackendTrendingStorage
+from trending_service import parse_args
 
 
 class _Response:
@@ -110,3 +114,18 @@ def test_trending_snapshot_is_enriched_and_published_atomically():
     assert captured[0]["repositories"][0]["rank"] == 1
     assert captured[0]["repositories"][0]["score"] == 7.0
     assert "repo_id" not in captured[0]["repositories"][0]
+
+
+def test_trending_worker_has_no_direct_qdrant_delivery_path():
+    import trending.config as config
+
+    assert not hasattr(config, "TRENDING_QDRANT_SYNC_ENABLED")
+    assert not hasattr(config, "TRENDING_QDRANT_SYNC_STR")
+    assert find_spec("trending.qdrant_sync") is None
+
+
+def test_trending_cli_rejects_retired_direct_qdrant_flags():
+    with pytest.raises(SystemExit):
+        parse_args(["--once", "--sync-qdrant"])
+    with pytest.raises(SystemExit):
+        parse_args(["--once", "--no-sync-qdrant"])

@@ -1,0 +1,17 @@
+{
+  "model_file": "heavy_ranker.pt",
+  "scaler_file": "feature_scaler.json",
+  "model_version": "heavy-ranker-v1",
+  "embedding_version": "repo-embedding-v1",
+  "feature_spec_version": "v1",
+  "input_dim": 778,
+  "embedding_dim": 384,
+  "feature_count": 10,
+  "value_weights": {
+    "ctr": 1.0,
+    "save": 5.0,
+    "gh_open": 2.0,
+    "dwell": 0.1,
+    "follow": 20.0
+  }
+}

@@ -1,6 +1,17 @@
-#Not to deploy, just to generate data and train or test the nn.
+# Not to deploy, just to generate data and train or test the neural network.
+
+import sys
+from pathlib import Path
 
 import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from inference.feature_spec import FEATURE_ORDER  # noqa: E402
+
 
 def generate_synthetic_data(num_users=1000, num_repos=10000, emb_dim=384, output_file="training_data.npz"):
     print(f"Generating {num_users} users and {num_repos} repos...")
@@ -51,12 +62,27 @@ def generate_synthetic_data(num_users=1000, num_repos=10000, emb_dim=384, output
     # We correlate it slightly with semantic affinity for realism
     skill_match_score = np.clip(base_affinity * 0.5 + np.random.normal(0.5, 0.2, size=num_interactions), 0, 1).astype(np.float32)
     
-    # Combine all 10 dense features into one array
-    batch_dense = np.column_stack((
-        batch_doc, batch_health, batch_readme, 
-        batch_stars, batch_forks, batch_issues, 
-        batch_pushed, batch_activity, batch_trend, skill_match_score
-    )).astype(np.float32)
+    # FEATURE_ORDER column mapping: doc_quality=batch_doc,
+    # code_health=batch_health, readme_length=batch_readme,
+    # star_count=batch_stars, fork_count=batch_forks,
+    # open_issues_count=batch_issues, pushed_days_ago=batch_pushed,
+    # activity_score=batch_activity, trend_velocity=batch_trend,
+    # skill_match_score=skill_match_score.
+    dense_columns = {
+        "doc_quality": batch_doc,
+        "code_health": batch_health,
+        "readme_length": batch_readme,
+        "star_count": batch_stars,
+        "fork_count": batch_forks,
+        "open_issues_count": batch_issues,
+        "pushed_days_ago": batch_pushed,
+        "activity_score": batch_activity,
+        "trend_velocity": batch_trend,
+        "skill_match_score": skill_match_score,
+    }
+    batch_dense = np.column_stack(
+        [dense_columns[name] for name in FEATURE_ORDER]
+    ).astype(np.float32)
     
     # 4. Generate the 5 Labels (Now influenced by the new features!)
     # Clicks influenced by trend velocity and skill match

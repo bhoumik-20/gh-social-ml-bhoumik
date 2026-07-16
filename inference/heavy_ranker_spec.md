@@ -30,7 +30,7 @@ The network requires a single concatenated tensor of size 778, consisting of 3 c
 
 **Dynamic Cross-Features**
 10. `skill_match_score` (Float percentage 0.0-1.0)
-    - *Tweak Note:* This is entirely stateless and calculated on the fly in the backend API (FastAPI/Node). It performs a fast Set Intersection between the User's `interests/skills` string arrays and the Repo's native `languages/topics/tags` Qdrant string arrays.
+    - This is entirely stateless and calculated inside `RankerService`. It performs a fast set intersection between the user's profile terms and the repository `languages/topics/tags` Qdrant payload fields.
 
 ## 3. Network Outputs (5 Tasks)
 The MMoE architecture routes the 778-dim input through 4 Shared Experts, and outputs 5 distinct predictions via 5 Task Heads:
@@ -42,17 +42,18 @@ The MMoE architecture routes the 778-dim input through 4 Shared Experts, and out
 5. `Dwell Time` (Regression -> ReLU, normalized fraction 0.0 to 1.0, where 1.0 = 600s)
 
 ## 4. The Value Function (Final Ranking)
-The 5 outputs are fed into a hard-coded algebraic equation in the backend to calculate the final rank `Score`. The 150 candidate repos are sorted descending by this score before being chopped into batches of 15 for the frontend.
+The 5 outputs are fed into the canonical ML value function in `inference/value_function.py`. The candidate pool is sorted descending by this internal score before feed shaping.
 
-`Score = (w1 * p_ctr) + (w2 * p_save) + (w3 * p_gh) + (w4 * p_fol) + (w5 * p_dwell)`
+`Score = (1.0 * p_ctr) + (5.0 * p_save) + (2.0 * p_gh) + (0.1 * p_dwell) + (20.0 * p_follow)`
 
-## 5. The Batching Architecture (True Ranking vs Micro-Sorting)
-To ensure the user gets the absolute best content, the Heavy Ranker must evaluate the entire candidate pool retrieved by the Vector Database before serving the user.
+## 5. Backend v2 Serving Contract
+The Heavy Ranker evaluates the entire candidate pool before shaping or truncation. Qdrant records must use the backend-issued UUID `repo_id`; names and URLs are attributes only.
 
 **The Production Flow:**
-1. **Retrieval:** Qdrant retrieves 150 candidate repos based purely on semantic similarity.
-2. **Initial True Ranking:** The backend passes *all 150 repos* through the Neural Network simultaneously. This takes <5ms and sorts them by actual quality (Stars, Health, Skill Match), rescuing "hidden gems" that Qdrant may have placed at the bottom.
-3. **Serve Batch 1:** The backend slices the Top 15 repos from the newly sorted list and sends them to the frontend.
-4. **Real-Time Update:** As the user interacts with Batch 1, their semantic User Embedding is updated.
-5. **Re-Ranking:** The backend takes the remaining 135 unseen repos and runs them through the Neural Network again using the *new* User Embedding. 
-6. **Serve Batch 2:** The newly re-sorted Top 15 are served to the user, reflecting their most recent interactions in real-time.
+1. **Retrieval:** Qdrant supplies semantic and discovery candidates with complete payloads and 384-dimensional vectors.
+2. **True Ranking:** ML passes the complete candidate pool through the network and sorts it by the canonical value score.
+3. **Feed Shaping:** ML removes seen UUIDs and applies freshness, language diversity, and exploration.
+4. **Recommendation Response:** ML returns only unique `{repo_id, score, source}` items plus `schema_version`, `generation_id`, `user_id`, `feed_version`, `model_version`, and `embedding_version`.
+5. **Backend Serve:** The backend persists the feed serve and hydrates repository cards from PostgreSQL. ML never serves repository metadata directly to the frontend.
+
+The three internal 15-item batches remain a compatibility implementation detail for the existing v1 adapter. They are not the backend v2 wire contract.

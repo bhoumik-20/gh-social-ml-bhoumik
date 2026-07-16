@@ -13,6 +13,122 @@ client = TestClient(app)
 class TestFeedAssemblySystem:
     """Unit tests for the FeedAssemblySystem class."""
 
+    def test_process_feed_assembly_preserves_zero_scores(self):
+        candidates = [
+            {"repo_id": "repo-zero", "final_score": 0.0},
+            {"repo_id": "repo-positive", "final_score": 0.1},
+        ]
+
+        ordered_ids = FeedAssemblySystem.process_feed_assembly(
+            candidates,
+            target_size=2,
+        )
+
+        assert ordered_ids == ["repo-positive", "repo-zero"]
+
+    def test_shape_batch_empty_input_returns_empty(self):
+        assert FeedAssemblySystem().shape_batch([]) == []
+
+    def test_shape_batch_with_no_seen_repos(self):
+        ranked = [
+            {"repo_id": "repo-1", "final_score": 2.0},
+            {"repo_id": "repo-2", "final_score": 1.0},
+        ]
+
+        result = FeedAssemblySystem().shape_batch(ranked)
+
+        assert [item["repo_id"] for item in result] == ["repo-1", "repo-2"]
+
+    def test_shape_batch_all_repos_seen_returns_empty(self):
+        ranked = [
+            {"repo_id": "repo-1", "final_score": 2.0},
+            {"repo_id": "repo-2", "final_score": 1.0},
+        ]
+
+        result = FeedAssemblySystem().shape_batch(
+            ranked,
+            seen_repo_ids={"repo-1", "repo-2"},
+        )
+
+        assert result == []
+
+    def test_shape_batch_removes_seen_repos(self):
+        ranked = [
+            {"repo_id": "repo-1", "final_score": 2.0},
+            {"repo_id": "repo-2", "final_score": 1.0},
+        ]
+
+        result = FeedAssemblySystem().shape_batch(
+            ranked,
+            seen_repo_ids={"repo-1"},
+        )
+
+        assert [item["repo_id"] for item in result] == ["repo-2"]
+
+    def test_shape_batch_diversity_cap(self):
+        ranked = [
+            {
+                "repo_id": f"repo-{i}",
+                "final_score": 10.0 - i,
+                "primary_language": "Python",
+            }
+            for i in range(10)
+        ]
+
+        with patch("random.shuffle"):
+            result = FeedAssemblySystem().shape_batch(ranked)
+
+        assert [item["repo_id"] for item in result[:5]] == [
+            f"repo-{i}" for i in range(5)
+        ]
+        assert {item["repo_id"] for item in result[5:]} == {
+            f"repo-{i}" for i in range(5, 10)
+        }
+
+    def test_shape_batch_freshness_boost_promotes_fresh_repo(self):
+        now = datetime.now(timezone.utc)
+        ranked = [
+            {
+                "repo_id": "repo-old",
+                "final_score": 10.1,
+                "created_at": now - timedelta(days=10),
+            },
+            {
+                "repo_id": "repo-fresh",
+                "final_score": 10.0,
+                "created_at": now - timedelta(hours=1),
+            },
+        ]
+
+        result = FeedAssemblySystem().shape_batch(ranked)
+
+        assert result[0]["repo_id"] == "repo-fresh"
+        assert result[0]["final_score"] > result[1]["final_score"]
+
+    def test_shape_batch_exploration_shuffles_tail(self):
+        now = datetime.now(timezone.utc)
+        ranked = [
+            {
+                "repo_id": f"repo-{i}",
+                "final_score": 100.0 - i,
+                "created_at": now - timedelta(days=10),
+                "primary_language": f"language-{i}",
+            }
+            for i in range(15)
+        ]
+
+        with patch("random.shuffle") as mock_shuffle:
+            result = FeedAssemblySystem().shape_batch(ranked)
+
+        mock_shuffle.assert_called_once()
+        shuffled_tail = mock_shuffle.call_args.args[0]
+        assert [item["repo_id"] for item in shuffled_tail] == [
+            f"repo-{i}" for i in range(10, 15)
+        ]
+        assert [item["repo_id"] for item in result[:10]] == [
+            f"repo-{i}" for i in range(10)
+        ]
+
     def test_process_feed_assembly_empty(self):
         """Test that passing an empty list of candidates returns an empty list."""
         assert FeedAssemblySystem.process_feed_assembly([], target_size=15) == []

@@ -87,7 +87,7 @@ Inspect the final `Corpus run report` log and the checkpoint's `last_run`, `fail
 
 ## Trending refresh
 
-Run one forced refresh and synchronize existing Qdrant points:
+Run one forced refresh and publish an atomic snapshot to the backend:
 
 ```bash
 python3 trending_service.py --once
@@ -101,7 +101,7 @@ python3 trending_service.py --scheduled
 
 The scheduler handles `SIGINT` and `SIGTERM`. A normal stop clears its in-process schedule and exits the loop.
 
-A partial Postgres trending write prevents Qdrant synchronization. Missing Qdrant points are logged and skipped. Per-point payload failures are isolated, reported, and cause the refresh command to return failure so operations can investigate.
+The production path is `trending worker → backend snapshot API → backend outbox → ML refresh → Qdrant`. The trending worker never connects to Qdrant or patches repository payloads directly. An incomplete enrichment batch or failed backend snapshot request fails the refresh atomically; inspect the backend outbox and ML refresh workers for downstream delivery failures.
 
 ## Diagnosis
 
@@ -112,7 +112,7 @@ A partial Postgres trending write prevents Qdrant synchronization. Missing Qdran
 | No acquisition progress | Discovery returned nothing new, filtering rejected everything, or the database count did not advance | Inspect rejection and failure records before increasing limits |
 | `pending_persistence` is non-empty | Repositories still require enrichment/Postgres persistence | Rerun the same bounded corpus command |
 | `pending_index` is non-empty | Postgres succeeded but Qdrant indexing did not | Restore Qdrant, then rerun without `--no-index-qdrant` |
-| Trending repository is missing in Qdrant | The repo has no existing corpus point | Let normal corpus acquisition approve and index it; do not create a vector from trending HTML |
+| Trending repository is missing in Qdrant | The backend outbox or ML refresh has not completed, or the repository has no approved corpus point | Inspect backend outbox/ML refresh state; let normal corpus acquisition approve missing repositories rather than writing Qdrant from the trending worker |
 | Unsupported embedding model | The embedding owner has not published a compatible model/dimension contract | Keep the current model until the shared embedding interface is updated |
 
 ## Verification before handoff
