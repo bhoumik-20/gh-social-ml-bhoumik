@@ -118,24 +118,20 @@ def test_handler_like_event(mock_qdrant_cls, mock_db_cls):
     
     assert success is True
 
-    # Assert Postgres metric increment was executed
-    assert mock_db.connect.call_count == 1  # 1 for transaction
-    
+    # Assert Postgres metric increment was executed through the active transaction
+    assert mock_db._get_connection.call_count == 1
+
     # Retrieve connection and cursor mock instances to check execution history
-    mock_conn = mock_db.connect.return_value
+    mock_conn = mock_db._get_connection.return_value
     mock_cursor = mock_conn.cursor.return_value
     execute_calls = mock_cursor.execute.call_args_list
     
-    assert len(execute_calls) >= 3
+    assert len(execute_calls) >= 2
     
     # Verify increment SQL was called (index 1 because 0 is store.record)
     sql = execute_calls[1][0][0]
     assert "UPDATE Repo" in sql
     assert "likes_count" in sql
-
-    # Verify cache invalidation SQL was called (index 2)
-    sql_cache = execute_calls[2][0][0]
-    assert "DELETE FROM user_recommendation_batches" in sql_cache
 
     # Assert Qdrant upsert was called with updated vector
     assert mock_qdrant.upsert.call_count == 1

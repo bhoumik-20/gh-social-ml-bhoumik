@@ -491,7 +491,7 @@ class FeedbackHandler:
             return False
 
     def invalidate_user_feed_cache(self, user_id: str) -> bool:
-        """Invalidate persisted batches and the backend Redis delivery queue."""
+        """Invalidate only the backend-owned Redis delivery queue."""
         redis_success = True
         if self.redis_client:
             try:
@@ -499,27 +499,4 @@ class FeedbackHandler:
             except Exception as exc:
                 logger.error("Failed to invalidate Redis feed for '%s': %s", user_id, exc)
                 redis_success = False
-
-        if not self.db.enabled:
-            return redis_success
-
-        conn = None
-        try:
-            conn = self.db.connect()
-            cursor = conn.cursor()
-
-            # Delete cache row for user
-            query = "DELETE FROM user_recommendation_batches WHERE user_id = %s;"
-            cursor.execute(query, (user_id,))
-            conn.commit()
-
-            logger.info("Invalidated recommendation cache for user '%s'", user_id)
-            return redis_success
-        except Exception as exc:
-            logger.error("Failed to delete cache in PostgreSQL for user '%s': %s", user_id, exc)
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return False
+        return redis_success
