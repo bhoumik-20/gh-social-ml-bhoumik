@@ -13,6 +13,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
+@pytest.fixture
+def anyio_backend():
+    """The feedback consumer is asyncio-native; do not duplicate it under Trio."""
+    return "asyncio"
+
+
 # ── Test Configuration ─────────────────────────────────────────────────────────────
 
 def pytest_configure(config):

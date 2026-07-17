@@ -309,3 +309,8 @@ async def health_check():
         status_code=200 if healthy else 503,
         content={"status": "healthy" if healthy else "unhealthy", "checks": checks},
     )
+
+
+from api.v2 import router as v2_router
+
+app.include_router(v2_router)
