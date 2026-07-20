@@ -119,6 +119,7 @@ def test_ensure_collection_creates_and_validates_schema_and_all_indexes():
     assert set(schemas) == set(QDRANT_PAYLOAD_INDEX_FIELDS)
     assert schemas["star_count"] == models.PayloadSchemaType.INTEGER
     assert schemas["pushed_days_ago"] == models.PayloadSchemaType.INTEGER
+    assert schemas["content_version"] == models.PayloadSchemaType.INTEGER
     assert schemas["trend_velocity"] == models.PayloadSchemaType.FLOAT
     assert schemas["activity_score"] == models.PayloadSchemaType.FLOAT
     assert schemas["doc_quality"] == models.PayloadSchemaType.FLOAT

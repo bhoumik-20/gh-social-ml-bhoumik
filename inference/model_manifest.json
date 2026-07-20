@@ -3,6 +3,11 @@
   "scaler_file": "feature_scaler.json",
   "model_version": "heavy-ranker-v1",
   "embedding_version": "repo-embedding-v1",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "compatible_embedding_versions": [
+    "repo-embedding-v1",
+    "repo-embedding-v2"
+  ],
   "feature_spec_version": "v1",
   "input_dim": 778,
   "embedding_dim": 384,

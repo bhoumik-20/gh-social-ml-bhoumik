@@ -107,6 +107,7 @@ QDRANT_PAYLOAD_INDEX_FIELDS = [
     "doc_quality",
     "code_health",
     "pushed_days_ago",
+    "content_version",
     "updated_at",
     "pushed_at",
 ]

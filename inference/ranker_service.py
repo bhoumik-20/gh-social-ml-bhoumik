@@ -1,9 +1,11 @@
-import torch
-import torch.nn as nn
-import numpy as np
 import json
 import logging
 import os
+from collections.abc import Iterable
+
+import numpy as np
+import torch
+import torch.nn as nn
 
 from inference.feature_spec import (
     EMBEDDING_DIM,
@@ -18,6 +20,7 @@ from config import REPOSITORY_EMBEDDING_VERSION
 
 
 logger = logging.getLogger("pipeline.ranker")
+STANDARDIZED_FEATURE_CLIP = 8.0
 
 class MMoEHeavyRanker(nn.Module):
     def __init__(self, input_dim, num_experts=4):
@@ -67,20 +70,30 @@ class MMoEHeavyRanker(nn.Module):
         
         return out_ctr, out_save, out_gh, out_dwell, out_follow
 
+def _keywords(values: object) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, Iterable):
+        values = [values]
+    return {
+        text.casefold()
+        for value in values
+        if value is not None and (text := str(value).strip())
+    }
+
+
 def calculate_match_score(user_interests_skills, repo_languages, repo_topics, repo_tags):
     """Calculates the percentage of overlapping keywords dynamically."""
-    if not user_interests_skills:
+    user_keywords = _keywords(user_interests_skills)
+    if not user_keywords:
         return 0.0
-    
-    # Combine all repo text arrays into one set of lowercase keywords
-    repo_keywords = set([str(w).lower() for w in repo_languages + repo_topics + repo_tags])
-    
-    matches = 0
-    for skill in user_interests_skills:
-        if str(skill).lower() in repo_keywords:
-            matches += 1
-            
-    return matches / len(user_interests_skills)
+
+    repo_keywords = (
+        _keywords(repo_languages) | _keywords(repo_topics) | _keywords(repo_tags)
+    )
+    return len(user_keywords & repo_keywords) / len(user_keywords)
 
 class RankerService:
     def __init__(
@@ -89,11 +102,13 @@ class RankerService:
         scaler_path="feature_scaler.json",
         emb_dim=384,
         manifest_path=None,
+        expected_embedding_version=None,
     ):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.emb_dim = EMBEDDING_DIM
         self.model_version = RANKER_MODEL_VERSION
         self.embedding_version = REPOSITORY_EMBEDDING_VERSION
+        self.compatible_embedding_versions = {self.embedding_version}
         self.feature_spec_version = FEATURE_SPEC_VERSION
         
         # Total input dim = User_emb(384) + Repo_emb(384) + DenseFeatures(10)
@@ -129,7 +144,35 @@ class RankerService:
                 manifest.get("embedding_version")
                 or REPOSITORY_EMBEDDING_VERSION
             )
+            raw_compatible_versions = manifest.get("compatible_embedding_versions")
+            if raw_compatible_versions is None:
+                raw_compatible_versions = [self.embedding_version]
+            if (
+                not isinstance(raw_compatible_versions, list)
+                or not raw_compatible_versions
+                or not all(
+                    isinstance(version, str) and version.strip()
+                    for version in raw_compatible_versions
+                )
+            ):
+                raise ValueError(
+                    "Model manifest compatible_embedding_versions must be a "
+                    "non-empty list of strings"
+                )
+            self.compatible_embedding_versions = {
+                version.strip() for version in raw_compatible_versions
+            }
             logger.info("Model manifest loaded successfully from %s", manifest_path)
+
+        if (
+            expected_embedding_version
+            and expected_embedding_version not in self.compatible_embedding_versions
+        ):
+            raise ValueError(
+                "Heavy ranker embedding contract is incompatible with serving: "
+                f"expected {expected_embedding_version!r}, compatible versions are "
+                f"{sorted(self.compatible_embedding_versions)!r}"
+            )
         
         # Load Model
         self.model = MMoEHeavyRanker(self.input_dim).to(self.device)
@@ -153,9 +196,45 @@ class RankerService:
                     f"Feature scaler has {len(self.scaler_mean)} features; "
                     f"expected {FEATURE_COUNT}"
                 )
+            if len(self.scaler_scale) != FEATURE_COUNT:
+                raise ValueError(
+                    f"Feature scaler has {len(self.scaler_scale)} scale values; "
+                    f"expected {FEATURE_COUNT}"
+                )
+            if not np.all(np.isfinite(self.scaler_mean)):
+                raise ValueError("Feature scaler means must all be finite")
+            if not np.all(np.isfinite(self.scaler_scale)) or np.any(
+                self.scaler_scale <= 0
+            ):
+                raise ValueError("Feature scaler scales must be finite and positive")
             logger.info("Feature scaler loaded successfully from %s", scaler_path)
         else:
             raise RuntimeError(f"{scaler_path} not found; refusing to use unscaled features")
+
+    @property
+    def ready(self) -> bool:
+        return self._model_loaded
+
+    def _embedding(self, value, *, field_name: str) -> np.ndarray:
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.shape != (self.emb_dim,):
+            raise ValueError(
+                f"{field_name} must contain exactly {self.emb_dim} values; "
+                f"got shape {vector.shape}"
+            )
+        if not np.all(np.isfinite(vector)):
+            raise ValueError(f"{field_name} must contain only finite values")
+        return vector
+
+    @staticmethod
+    def _finite_feature(value, *, default: float) -> float:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if np.isfinite(number) else default
 
     def score_batch(self, user_embedding, user_skills, candidate_repos):
         """
@@ -167,10 +246,19 @@ class RankerService:
 
         if not candidate_repos:
             return []
-            
+
         # 1. Prepare inputs
-        user_embs = np.tile(user_embedding, (len(candidate_repos), 1))
-        repo_embs = np.vstack([repo['embedding'] for repo in candidate_repos])
+        user_vector = self._embedding(user_embedding, field_name="user_embedding")
+        user_embs = np.tile(user_vector, (len(candidate_repos), 1))
+        repo_embs = np.vstack(
+            [
+                self._embedding(
+                    repo.get("embedding"),
+                    field_name=f"candidate {repo.get('id', '<unknown>')} embedding",
+                )
+                for repo in candidate_repos
+            ]
+        )
         
         dense_features = []
         for repo in candidate_repos:
@@ -180,28 +268,40 @@ class RankerService:
             # The EXACT 10 features generated in DataGen:
             # batch_doc, batch_health, batch_readme, batch_stars, batch_forks, batch_issues, batch_pushed, batch_activity, batch_trend, skill_match_score
             feature_values = {
-                'doc_quality': repo.get('doc_quality', 0.5),
-                'code_health': repo.get('code_health', 0.5),
-                'readme_length': repo.get('readme_length', 1000),
-                'star_count': repo.get('star_count', 0),
-                'fork_count': repo.get('fork_count', 0),
-                'open_issues_count': repo.get('open_issues_count', 0),
-                'pushed_days_ago': repo.get('pushed_days_ago', 365),
-                'activity_score': repo.get('activity_score', 0.0),
-                'trend_velocity': repo.get('trend_velocity', 0.0),
+                'doc_quality': self._finite_feature(repo.get('doc_quality'), default=0.5),
+                'code_health': self._finite_feature(repo.get('code_health'), default=0.5),
+                'readme_length': self._finite_feature(repo.get('readme_length'), default=1000),
+                'star_count': self._finite_feature(repo.get('star_count'), default=0),
+                'fork_count': self._finite_feature(repo.get('fork_count'), default=0),
+                'open_issues_count': self._finite_feature(repo.get('open_issues_count'), default=0),
+                'pushed_days_ago': self._finite_feature(repo.get('pushed_days_ago'), default=365),
+                'activity_score': self._finite_feature(repo.get('activity_score'), default=0.0),
+                'trend_velocity': self._finite_feature(repo.get('trend_velocity'), default=0.0),
                 'skill_match_score': skill_match,
             }
             row = [feature_values[name] for name in FEATURE_ORDER]
             dense_features.append(row)
             
-        dense_features = np.array(dense_features)
+        dense_features = np.asarray(dense_features, dtype=np.float32)
         unscaled_features = dense_features.copy()
         
         # Manually apply StandardScaler math
         dense_features = (dense_features - self.scaler_mean) / self.scaler_scale
+        dense_features = np.clip(
+            dense_features,
+            -STANDARDIZED_FEATURE_CLIP,
+            STANDARDIZED_FEATURE_CLIP,
+        )
             
         # Concatenate into massive input tensor
         X = np.hstack((user_embs, repo_embs, dense_features))
+        if X.shape != (len(candidate_repos), self.input_dim):
+            raise ValueError(
+                f"Heavy ranker input has shape {X.shape}; expected "
+                f"({len(candidate_repos)}, {self.input_dim})"
+            )
+        if not np.all(np.isfinite(X)):
+            raise ValueError("Heavy ranker input contains non-finite values")
         X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
         
         # 2. Run Heavy Ranker Inference
@@ -212,11 +312,15 @@ class RankerService:
             if len(candidate_repos) == 1:
                 p_ctr, p_save, p_gh, p_dwell, p_fol = p_ctr.unsqueeze(0), p_save.unsqueeze(0), p_gh.unsqueeze(0), p_dwell.unsqueeze(0), p_fol.unsqueeze(0)
                 
-            p_ctr = p_ctr.cpu().numpy()
-            p_save = p_save.cpu().numpy()
-            p_gh = p_gh.cpu().numpy()
-            p_dwell = p_dwell.cpu().numpy()
-            p_fol = p_fol.cpu().numpy()
+            p_ctr = np.clip(p_ctr.cpu().numpy(), 0.0, 1.0)
+            p_save = np.clip(p_save.cpu().numpy(), 0.0, 1.0)
+            p_gh = np.clip(p_gh.cpu().numpy(), 0.0, 1.0)
+            p_dwell = np.clip(p_dwell.cpu().numpy(), 0.0, 1.0)
+            p_fol = np.clip(p_fol.cpu().numpy(), 0.0, 1.0)
+
+        predictions = np.column_stack((p_ctr, p_save, p_gh, p_dwell, p_fol))
+        if not np.all(np.isfinite(predictions)):
+            raise ValueError("Heavy ranker produced non-finite predictions")
 
         # 3. Apply the value function and attach scores.
         results = []
@@ -228,9 +332,12 @@ class RankerService:
                 "pred_dwell_fraction": float(p_dwell[i]),
                 "p_follow": float(p_fol[i]),
             }
+            final_score = float(compute_value_score(predictions_dict))
+            if not np.isfinite(final_score):
+                raise ValueError("Heavy ranker produced a non-finite value score")
             results.append({
                 "repo_id": repo['id'],
-                "final_score": compute_value_score(predictions_dict),
+                "final_score": final_score,
                 "skill_match": float(unscaled_features[i][9]), # For debug
                 "predictions": predictions_dict,
             })

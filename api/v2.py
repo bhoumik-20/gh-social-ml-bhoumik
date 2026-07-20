@@ -299,13 +299,14 @@ def _refresh_repository_job(request: RepositoryRefreshJob) -> dict[str, Any]:
     "/recommendations/generate", dependencies=[Depends(require_internal_secret)]
 )
 async def generate_recommendations(request: RecommendationRequest):
-    items = await run_in_threadpool(
-        retriever().recommend,
+    batch = await run_in_threadpool(
+        retriever().recommend_batch,
         str(request.user_id),
         request.limit,
         [str(item) for item in request.exclude_repo_ids],
         str(request.generation_id),
     )
+    items = batch.items
     invalid_scores = any(not math.isfinite(item.score) for item in items)
     if len({item.repo_id for item in items}) != len(items) or invalid_scores:
         raise HTTPException(
@@ -316,8 +317,8 @@ async def generate_recommendations(request: RecommendationRequest):
         "generation_id": str(request.generation_id),
         "user_id": str(request.user_id),
         "feed_version": request.feed_version,
-        "model_version": retriever().model_version,
-        "embedding_version": retriever().embedding_version,
+        "model_version": batch.model_version,
+        "embedding_version": batch.embedding_version,
         "items": [asdict(item) for item in items],
     }
 

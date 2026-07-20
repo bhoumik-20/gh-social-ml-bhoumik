@@ -15,6 +15,7 @@ from api.v2 import (
     router,
 )
 from embedding.qdrant_store import QdrantRepositoryStore
+from retrieval.v2_retriever import RecommendationBatch, RankedRepository
 
 
 def test_recommendation_contract_rejects_duplicate_exclusions():
@@ -87,6 +88,45 @@ def test_v2_auth_uses_configured_internal_header(monkeypatch):
             "/api/v2/health",
             headers={"x-ml-service-secret": "test-internal-secret"},
         ).status_code == 200
+
+
+def test_recommendation_response_reports_the_model_that_served_the_request(monkeypatch):
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    user_id = uuid.uuid4()
+    repo_id = uuid.uuid4()
+    batch = RecommendationBatch(
+        items=[RankedRepository(str(repo_id), 0.75, "semantic")],
+        model_version="heavy-ranker-v1-v2-adapter",
+        embedding_version="repo-embedding-v2",
+        ranker_applied=True,
+    )
+    fake_retriever = SimpleNamespace(
+        recommend_batch=lambda *_args: batch,
+        model_version="wrong-static-version",
+        embedding_version="wrong-static-version",
+    )
+
+    with patch("api.v2.retriever", return_value=fake_retriever):
+        response = client.post(
+            "/api/v2/recommendations/generate",
+            headers={"x-internal-secret": "test-internal-secret"},
+            json={
+                "schema_version": 2,
+                "generation_id": str(uuid.uuid4()),
+                "user_id": str(user_id),
+                "feed_version": 1,
+                "limit": 10,
+                "exclude_repo_ids": [],
+                "context": {"cold_start": False},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["model_version"] == "heavy-ranker-v1-v2-adapter"
+    assert response.json()["embedding_version"] == "repo-embedding-v2"
 
 
 def test_repository_jobs_are_idempotent_and_monotonic():

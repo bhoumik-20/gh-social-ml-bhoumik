@@ -159,6 +159,14 @@ root-owned `/etc/gh-social/ml.env`. V2 health fails when the consumer heartbeat
 is absent. Deployment rolls back from `gh-social-ml:current` to
 `gh-social-ml:previous` if authenticated V2 health fails.
 
+V2 recommendations use the checked-in heavy ranker through a compatibility
+adapter when `V2_HEAVY_RANKER_ENABLED=true`. Candidate or model validation
+failures fall back per request to `qdrant-hybrid-v2`; setting the flag to
+`false` is the deployment-wide rollback switch. Health reports whether the
+artifact loaded and how many Qdrant repository points satisfy the V2 content
+contract. Production sets `V2_HEAVY_RANKER_REQUIRED=true` so a missing or
+incompatible artifact fails deployment health and triggers image rollback.
+
 ## Tests
 
 Run the default suite:

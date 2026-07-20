@@ -339,7 +339,7 @@ class QdrantRepositoryStore:
         # The below schema selection is for keeping payload indexes aligned with
         # the payload fields emitted by build_vector_payload.
         schema = self.models.PayloadSchemaType.KEYWORD
-        if field_name in {"star_count", "pushed_days_ago"}:
+        if field_name in {"star_count", "pushed_days_ago", "content_version"}:
             schema = self.models.PayloadSchemaType.INTEGER
         elif field_name in {
             "trend_velocity",

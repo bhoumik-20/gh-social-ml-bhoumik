@@ -109,6 +109,43 @@ def test_ranker_service_rejects_incompatible_manifest(tmp_path):
         )
 
 
+def test_ranker_service_accepts_explicit_v2_embedding_compatibility(tmp_path):
+    scaler_path = tmp_path / "feature_scaler.json"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    _write_manifest(
+        manifest_path,
+        compatible_embedding_versions=[
+            "repo-embedding-test",
+            "repo-embedding-v2",
+        ],
+    )
+
+    service = RankerService(
+        model_path=str(tmp_path / "missing_model.pt"),
+        scaler_path=str(scaler_path),
+        manifest_path=str(manifest_path),
+        expected_embedding_version="repo-embedding-v2",
+    )
+
+    assert "repo-embedding-v2" in service.compatible_embedding_versions
+
+
+def test_ranker_service_rejects_unlisted_serving_embedding_version(tmp_path):
+    scaler_path = tmp_path / "feature_scaler.json"
+    manifest_path = tmp_path / "model_manifest.json"
+    _write_scaler(scaler_path)
+    _write_manifest(manifest_path)
+
+    with pytest.raises(ValueError, match="embedding contract is incompatible"):
+        RankerService(
+            model_path=str(tmp_path / "missing_model.pt"),
+            scaler_path=str(scaler_path),
+            manifest_path=str(manifest_path),
+            expected_embedding_version="repo-embedding-v2",
+        )
+
+
 def test_score_batch_empty_candidates_returns_empty(loaded_ranker_service):
     assert loaded_ranker_service.score_batch(
         np.zeros(384, dtype=np.float32),
@@ -193,3 +230,65 @@ def test_score_batch_preserves_repo_id_order_mapping(loaded_ranker_service):
     assert [result["repo_id"] for result in results] == [
         candidate["id"] for candidate in candidates
     ]
+
+
+def test_score_batch_rejects_wrong_embedding_dimensions(loaded_ranker_service):
+    with pytest.raises(ValueError, match="exactly 384"):
+        loaded_ranker_service.score_batch(
+            np.zeros(383, dtype=np.float32),
+            [],
+            [{"id": "repo-1", "embedding": np.zeros(384, dtype=np.float32)}],
+        )
+
+
+def test_score_batch_clips_outliers_and_prediction_ranges(loaded_ranker_service):
+    loaded_ranker_service.model = MagicMock(
+        return_value=(
+            torch.tensor(2.0),
+            torch.tensor(-1.0),
+            torch.tensor(0.5),
+            torch.tensor(4.0),
+            torch.tensor(0.25),
+        )
+    )
+
+    results = loaded_ranker_service.score_batch(
+        np.zeros(384, dtype=np.float32),
+        [],
+        [
+            {
+                "id": "repo-outlier",
+                "embedding": np.zeros(384, dtype=np.float32),
+                "star_count": 10**12,
+            }
+        ],
+    )
+
+    model_input = loaded_ranker_service.model.call_args.args[0].cpu().numpy()
+    assert model_input[0, 771] == pytest.approx(8.0)
+    assert results[0]["predictions"] == {
+        "p_ctr": 1.0,
+        "p_save": 0.0,
+        "p_gh": 0.5,
+        "pred_dwell_fraction": 1.0,
+        "p_follow": 0.25,
+    }
+
+
+def test_score_batch_rejects_non_finite_model_output(loaded_ranker_service):
+    loaded_ranker_service.model = MagicMock(
+        return_value=(
+            torch.tensor(float("nan")),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+    )
+
+    with pytest.raises(ValueError, match="non-finite predictions"):
+        loaded_ranker_service.score_batch(
+            np.zeros(384, dtype=np.float32),
+            [],
+            [{"id": "repo-1", "embedding": np.zeros(384, dtype=np.float32)}],
+        )
