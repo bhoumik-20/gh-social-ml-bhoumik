@@ -591,6 +591,35 @@ def test_cold_start_with_onboarding_profile_uses_required_heavy_ranker():
     assert client.query_calls  # the initial profile still personalizes retrieval
 
 
+def test_required_v2_cold_start_waits_for_onboarding_vector_without_hybrid():
+    client = HeavyRankerQdrant()
+    client.retrieve = lambda **_kwargs: []
+    retriever = QdrantV2Retriever(
+        client=client,
+        ranker=DeterministicHeavyRanker(),
+        heavy_ranker_enabled=True,
+        heavy_ranker_required=True,
+        heavy_ranker_traffic_percent=100,
+    )
+
+    with pytest.raises(
+        RetrievalDependencyError,
+        match="user profile vector is unavailable",
+    ):
+        retriever.recommend_batch(
+            client.user_id,
+            2,
+            [],
+            "cold-start-vector-pending",
+            True,
+        )
+
+    counters = retriever.health()["ranking_counters"]
+    assert counters["heavy_served"] == 0
+    assert counters["hybrid_served"] == 0
+    assert counters["fallback_user_vector_unavailable"] == 1
+
+
 def test_missing_profile_modes_are_explicit_for_cold_and_normal_requests():
     client = HeavyRankerQdrant()
     client.retrieve = lambda **_kwargs: []
